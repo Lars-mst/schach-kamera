@@ -2,7 +2,7 @@
 <html lang="de">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0d1014">
 <title>Schach Kamera</title>
@@ -14,34 +14,26 @@
   <canvas id="overlay"></canvas>
 
   <header id="topbar">
-    <div id="status" class="pill" data-tone="idle"><span class="dot"></span><span id="statusText">Bereit</span></div>
-    <button id="btnSettings" class="icon-btn" aria-label="Einstellungen">⚙︎</button>
+    <div id="status" class="pill" data-tone="idle" hidden><span class="dot"></span><span id="statusText"></span></div>
+    <div class="top-actions">
+      <button id="btnUndo" class="icon-btn" aria-label="Letzten Zug zurücknehmen" hidden>↶</button>
+      <button id="btnSettings" class="icon-btn" aria-label="Einstellungen">⚙︎</button>
+    </div>
   </header>
 
-  <aside id="mini" hidden></aside>
-
   <section id="panel" hidden>
-    <div id="suggestion">
-      <div class="label" id="sugLabel">Empfehlung</div>
-      <div class="move" id="sugMove">–</div>
-      <div class="meta" id="sugMeta"></div>
-    </div>
-    <div class="actions">
-      <button id="btnUndo">Zug zurück</button>
-      <button id="btnRotate">Brett drehen</button>
-      <button id="btnAdjust">Ecken anpassen</button>
-      <button id="btnRedetect">Neu erkennen</button>
-    </div>
+    <div id="sugMove">–</div>
+    <div id="sugMeta"></div>
   </section>
 
   <section id="intro">
     <h1>Schach Kamera</h1>
     <p class="lead">Richte die Kamera auf ein Schachbrett. Die App erkennt das Brett, verfolgt jeden Zug und zeigt dir direkt auf dem Brett, welche Figur wohin ziehen sollte.</p>
     <ul class="prereq">
-      <li><b>Grundstellung</b> aufbauen, bevor du startest (oder später eine Stellung als FEN eingeben).</li>
-      <li><b>Kamera fest</b> hinstellen: Handyhalter, Stativ oder die Logitech auf einen Stapel Bücher. Sie darf sich während der Partie nicht bewegen.</li>
-      <li><b>Ganzes Brett</b> im Bild, am besten von oben oder schräg von der Seite.</li>
-      <li><b>Gleichmäßiges Licht</b> ohne harte Schatten, und das Brett sollte sich vom Tisch abheben.</li>
+      <li><b>Grundstellung</b> aufbauen, bevor du startest.</li>
+      <li><b>Kamera fest</b> hinstellen (Halter, Stativ, Bücherstapel). Sie darf sich während der Partie nicht bewegen.</li>
+      <li><b>Ganzes Brett</b> im Bild, am besten möglichst von oben.</li>
+      <li><b>Gleichmäßiges Licht</b> ohne harte Schatten.</li>
     </ul>
     <label class="field">Ich spiele
       <select id="introColor">
@@ -57,6 +49,12 @@
   <section id="settings" hidden>
     <div class="sheet">
       <h2>Einstellungen</h2>
+      <div class="row">
+        <button id="btnRotate">Brett drehen</button>
+        <button id="btnAdjust">Ecken anpassen</button>
+        <button id="btnRedetect">Brett neu suchen</button>
+        <button id="btnManual">Ecken antippen</button>
+      </div>
       <label class="field">Kamera <select id="camSelect"></select></label>
       <label class="field">Ich spiele
         <select id="colorSelect">
@@ -67,9 +65,9 @@
       </label>
       <label class="field">Bedenkzeit Stockfish
         <select id="thinkSelect">
-          <option value="500">0,5 s</option>
-          <option value="1000" selected>1 s</option>
-          <option value="2500">2,5 s</option>
+          <option value="300">schnell (0,3 s)</option>
+          <option value="800" selected>normal (0,8 s)</option>
+          <option value="2000">stark (2 s)</option>
         </select>
       </label>
       <label class="field">Stellung (FEN)
@@ -78,12 +76,9 @@
       <div class="row">
         <button id="btnFen">Stellung übernehmen</button>
         <button id="btnNew">Neue Partie</button>
-      </div>
-      <div class="row">
-        <button id="btnManual">Ecken selbst antippen</button>
         <button id="btnClose" class="primary">Fertig</button>
       </div>
-      <p class="fine">Tipp: Wird ein Zug nicht erkannt, tippe im Bild erst auf das Startfeld und dann auf das Zielfeld.</p>
+      <p class="fine">Wird ein Zug nicht erkannt, tippe im Bild erst auf das Startfeld und dann auf das Zielfeld.</p>
     </div>
   </section>
 

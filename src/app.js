@@ -26,14 +26,14 @@ const S = {
   Hinv: null,
   game: new Chess(),
   myColor: 'w',
-  thinkMs: 1000,
+  thinkMs: 800,
   ref: null,             // Feld-Merkmale der zuletzt bestätigten Stellung
   prev: null,
   stable: 0,
   evaluated: false,
   unclear: false,
   cand: null, candHits: 0,
-  best: null,            // { from, to, san, piece, color }
+  best: null,            // { uci, from, to, san, piece, color, final }
   evalText: '',
   lastMove: null,
   tapFrom: null,
@@ -87,14 +87,31 @@ function orderQuad(pts) {
   return [by((p) => p[0] + p[1]), by((p) => p[1] - p[0]), byMax((p) => p[0] + p[1]), byMax((p) => p[1] - p[0])];
 }
 
+const BOARD_CORNERS = [[0, 0], [0, 8], [8, 8], [8, 0]];
+// Im Uhrzeigersinn ab a1 folgen im Bild a8, h8, h1.
+const cornersFrom = (quad, a1) => [0, 1, 2, 3].map((i) => quad[(a1 + i) % 4]);
+
 function setBoard(quad, a1) {
   S.quad = quad;
   S.a1 = a1;
-  // Im Uhrzeigersinn ab a1 folgen im Bild a8, h8, h1.
-  const q = (i) => quad[(a1 + i) % 4];
-  const board = [[0, 0], [0, 8], [8, 8], [8, 0]];
-  S.H = homography(board, [q(0), q(1), q(2), q(3)]);
-  S.Hinv = homography([q(0), q(1), q(2), q(3)], board);
+  S.H = homography(BOARD_CORNERS, cornersFrom(quad, a1));
+  S.Hinv = homography(cornersFrom(quad, a1), BOARD_CORNERS);
+}
+
+// Für jede der 4 möglichen Ausrichtungen: welches Feld der aktuellen Beschriftung entspricht Feld s?
+function orientationPerms() {
+  const perms = [];
+  for (let o = 0; o < 4; o++) {
+    const Ho = homography(BOARD_CORNERS, cornersFrom(S.quad, o));
+    const perm = new Int8Array(64);
+    for (let s = 0; s < 64; s++) {
+      const [x, y] = project(Ho, (s % 8) + 0.5, (s >> 3) + 0.5);
+      const [u, v] = project(S.Hinv, x, y);
+      perm[s] = Math.min(7, Math.max(0, Math.floor(u))) + 8 * Math.min(7, Math.max(0, Math.floor(v)));
+    }
+    perms.push({ o, perm });
+  }
+  return perms;
 }
 
 /* ---------- Kamerabild lesen ---------- */
@@ -199,6 +216,7 @@ function refineGrid(img, quad) {
 }
 
 // a1 ist ein dunkles Eckfeld; Weiß steht auf der Seite mit den helleren Figuren.
+// Liegt die Schätzung daneben, korrigiert die Zugerkennung sie beim ersten Zug.
 function guessOrientation(img, grid, darkParity) {
   const Hg = homography([[0, 0], [8, 0], [8, 8], [0, 8]], grid);
   const band = (fn) => {
@@ -221,12 +239,12 @@ function searchStep(img) {
     const r = refineGrid(img, q.pts);
     if (r && r.contrast > 25 && r.score > 10 && (!found || r.score > found.score)) found = r;
   }
-  if (!found) { S.cand = null; S.candHits = 0; setStatus('Suche Schachbrett … ganzes Brett ins Bild, Kamera ruhig halten', 'search'); return; }
+  if (!found) { S.cand = null; S.candHits = 0; setStatus('Suche Schachbrett … ganzes Brett ins Bild', 'search'); return; }
   const close = S.cand && found.grid.every((p, i) => Math.hypot(p[0] - S.cand.grid[i][0], p[1] - S.cand.grid[i][1]) < img.width * 0.025);
   S.candHits = close ? S.candHits + 1 : 1;
   S.cand = found;
   setStatus('Schachbrett gefunden … halte still', 'search');
-  if (S.candHits >= 4) {
+  if (S.candHits >= 3) {
     setBoard(found.grid, guessOrientation(img, found.grid, found.darkParity));
     enterTrack();
   }
@@ -235,13 +253,15 @@ function searchStep(img) {
 /* ---------- Züge erkennen ---------- */
 
 const N = 5; // Stichproben pro Feld und Richtung
+const PER = N * N * 3;
+
 function features(img) {
-  const f = new Float32Array(64 * N * N * 3);
+  const f = new Float32Array(64 * PER);
   let k = 0;
   for (let sq = 0; sq < 64; sq++) {
     const file = sq % 8, rank = sq >> 3;
     for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
-      const [x, y] = project(S.H, file + 0.2 + (0.6 * (i + 0.5)) / N, rank + 0.2 + (0.6 * (j + 0.5)) / N);
+      const [x, y] = project(S.H, file + 0.18 + (0.64 * (i + 0.5)) / N, rank + 0.18 + (0.64 * (j + 0.5)) / N);
       const xi = Math.min(img.width - 1, Math.max(0, x | 0)), yi = Math.min(img.height - 1, Math.max(0, y | 0));
       const p = (yi * img.width + xi) * 4;
       f[k++] = img.data[p]; f[k++] = img.data[p + 1]; f[k++] = img.data[p + 2];
@@ -250,48 +270,155 @@ function features(img) {
   return f;
 }
 
+// Mittlere Farbe und Struktur (Streuung) pro Feld
+function squareStats(f) {
+  const mean = new Float32Array(64 * 3), tex = new Float32Array(64);
+  const n = PER / 3;
+  for (let sq = 0; sq < 64; sq++) {
+    const o = sq * PER;
+    let r = 0, g = 0, b = 0;
+    for (let k = 0; k < PER; k += 3) { r += f[o + k]; g += f[o + k + 1]; b += f[o + k + 2]; }
+    r /= n; g /= n; b /= n;
+    let v = 0;
+    for (let k = 0; k < PER; k += 3) v += Math.abs(f[o + k] - r) + Math.abs(f[o + k + 1] - g) + Math.abs(f[o + k + 2] - b);
+    mean[sq * 3] = r; mean[sq * 3 + 1] = g; mean[sq * 3 + 2] = b;
+    tex[sq] = v / n;
+  }
+  return { mean, tex };
+}
+
+const median = (arr) => { const s = Float32Array.from(arr).sort(); return s.length ? s[s.length >> 1] : 0; };
+
+// Unterschied pro Feld, nachdem Helligkeitsschwankungen der Kamera (Belichtung) herausgerechnet sind.
 function squareDiffs(a, b) {
-  const per = N * N * 3, d = new Float32Array(64);
+  const ma = squareStats(a).mean, mb = squareStats(b).mean;
+  const gain = [0, 1, 2].map((c) => {
+    const ratios = [];
+    for (let sq = 0; sq < 64; sq++) ratios.push((ma[sq * 3 + c] + 1) / (mb[sq * 3 + c] + 1));
+    return median(ratios);
+  });
+  const d = new Float32Array(64);
   for (let sq = 0; sq < 64; sq++) {
     let s = 0;
-    for (let k = sq * per, e = k + per; k < e; k++) s += Math.abs(a[k] - b[k]);
-    d[sq] = s / per;
+    for (let k = sq * PER, e = k + PER, c = 0; k < e; k++, c = (c + 1) % 3) s += Math.abs(a[k] - b[k] * gain[c]);
+    d[sq] = s / PER;
   }
   return d;
 }
 
 const sqIndex = (name) => FILES.indexOf(name[0]) + 8 * (Number(name[1]) - 1);
-const sqName = (i) => FILES[i % 8] + ((i >> 3) + 1);
+const isDark = (sq) => ((sq % 8) + (sq >> 3)) % 2 === 0; // a1 ist dunkel
 
 function involvedSquares(m) {
-  const s = [m.from, m.to];
+  const s = [[m.from, 0], [m.to, 1]]; // [Feld, nach dem Zug belegt?]
   const r = m.from[1];
-  if (m.flags.includes('k')) s.push('h' + r, 'f' + r);
-  if (m.flags.includes('q')) s.push('a' + r, 'd' + r);
-  if (m.flags.includes('e')) s.push(m.to[0] + m.from[1]);
-  return s.map(sqIndex);
+  if (m.flags.includes('k')) s.push(['h' + r, 0], ['f' + r, 1]);
+  if (m.flags.includes('q')) s.push(['a' + r, 0], ['d' + r, 1]);
+  if (m.flags.includes('e')) s.push([m.to[0] + m.from[1], 0]);
+  return s.map(([n, occ]) => [sqIndex(n), occ]);
 }
 
-function matchMove(d) {
-  const sorted = [...d].sort((a, b) => a - b);
-  const thr = Math.max(14, sorted[32] * 3 + 6);
+// Wie "belegt" sieht jedes Feld aus? Vergleich mit leeren Feldern gleicher Farbe,
+// die wir aus der bekannten Stellung kennen. 0 = sieht leer aus, 1 = sieht belegt aus.
+function occupancy(stats, game) {
+  const board = game.board();
+  const occupied = (sq) => !!board[7 - (sq >> 3)][sq % 8];
+  const emptyRef = [false, true].map((dark) => {
+    const cols = [[], [], []];
+    for (let sq = 0; sq < 64; sq++) if (!occupied(sq) && isDark(sq) === dark) for (let c = 0; c < 3; c++) cols[c].push(stats.mean[sq * 3 + c]);
+    return cols.map(median);
+  });
+  const dist = new Float32Array(64);
+  for (let sq = 0; sq < 64; sq++) {
+    const e = emptyRef[isDark(sq) ? 1 : 0];
+    let s = 0;
+    for (let c = 0; c < 3; c++) s += Math.abs(stats.mean[sq * 3 + c] - e[c]);
+    dist[sq] = s / 3 + stats.tex[sq];
+  }
+  const emptyD = [], occD = [];
+  for (let sq = 0; sq < 64; sq++) (occupied(sq) ? occD : emptyD).push(dist[sq]);
+  const De = median(emptyD), Do = median(occD);
+  const reliable = Do - De > 8;
+  const occ = new Float32Array(64);
+  for (let sq = 0; sq < 64; sq++) occ[sq] = reliable ? Math.min(1, Math.max(0, (dist[sq] - De) / (Do - De))) : 0.5;
+  return { occ, reliable };
+}
+
+// Nachbarfelder (auch zwei Reihen weit), in die eine Figur schräg von der Kamera aus hineinragen kann
+const NEIGH = Array.from({ length: 64 }, (_, sq) => {
+  const f = sq % 8, r = sq >> 3, out = [];
+  for (let df = -1; df <= 1; df++) for (let dr = -2; dr <= 2; dr++) {
+    const ff = f + df, rr = r + dr;
+    if ((df || dr) && ff >= 0 && ff < 8 && rr >= 0 && rr < 8) out.push(ff + 8 * rr);
+  }
+  return out;
+});
+
+function matchMove(d, stats) {
+  const thr = Math.max(12, median(d) * 3 + 5);
   const changed = [];
   d.forEach((v, i) => { if (v > thr) changed.push(i); });
-  if (!changed.length) return { kind: 'none' };
-  if (changed.length > 22) return { kind: 'camera' };
+  if (DEBUG && !changed.length) console.log('detect-dbg none thr', thr.toFixed(1), 'top', [...d].map((v, q) => [v, q]).sort((a, b) => b[0] - a[0]).slice(0, 4).map(([v, q]) => FILES[q % 8] + ((q >> 3) + 1) + ':' + (v / thr).toFixed(2)).join(' '));
+  const maxD = Math.max(...d);
+  // Gar nichts verändert: Referenz darf nachgeführt werden (langsame Lichtänderungen)
+  if (maxD < thr * 0.45) return { kind: 'none' };
+  if (changed.length > 24) return { kind: 'camera' };
+  const { occ, reliable } = occupancy(stats, S.game);
   let best = null, second = null;
   for (const m of S.game.moves({ verbose: true })) {
     if (m.promotion && m.promotion !== 'q') continue;
     const inv = involvedSquares(m);
-    if (Math.min(d[inv[0]], d[inv[1]]) < thr * 0.6) continue;
-    let score = inv.reduce((a, i) => a + d[i], 0);
-    for (const c of changed) if (!inv.includes(c)) score -= 1.5 * d[c];
+    if (d[inv[0][0]] < thr * 0.4 || d[inv[1][0]] < thr * 0.3) continue;
+    let score = 0;
+    const near = new Set();
+    for (const [sq, after] of inv) {
+      score += Math.min(4, d[sq] / thr);
+      if (reliable) score -= 1.2 * Math.abs(occ[sq] - after);
+      NEIGH[sq].forEach((n) => near.add(n));
+    }
+    // Veränderungen außerhalb des Zuges sprechen dagegen; direkt daneben sind es oft nur
+    // Figuren, die schräg ins Nachbarfeld ragen.
+    for (const c of changed) {
+      if (inv.some(([sq]) => sq === c)) continue;
+      score -= (near.has(c) ? 0.15 : 0.6) * Math.min(4, d[c] / thr);
+    }
     const cand = { m, score };
+    if (DEBUG) (matchMove.log ||= []).push([m.san, score.toFixed(2), inv.map(([q]) => FILES[q % 8] + ((q >> 3) + 1) + ':' + (d[q] / thr).toFixed(1) + '/' + occ[q].toFixed(2)).join(' ')]);
     if (!best || score > best.score) { second = best; best = cand; } else if (!second || score > second.score) second = cand;
   }
-  if (!best || best.score <= 0) return { kind: 'unclear', changed };
-  if (second && best.score - second.score < thr * 0.4) return { kind: 'unclear', changed };
-  return { kind: 'move', move: best.m };
+  if (DEBUG) {
+    console.log('detect-dbg thr', thr.toFixed(1), 'reliable', reliable, 'changed', changed.map((q) => FILES[q % 8] + ((q >> 3) + 1) + ':' + (d[q] / thr).toFixed(1)).join(' '));
+    (matchMove.log || []).sort((a, b) => b[1] - a[1]).slice(0, 4).forEach((l) => console.log('detect-dbg   ', l.join(' | ')));
+    matchMove.log = [];
+  }
+  const margin = best && second ? best.score - second.score : 9;
+  if (best && best.score >= 0.6 && margin >= 0.35) return { kind: 'move', move: best.m, score: best.score, margin, reliable };
+  // Nur schwache Veränderung ohne passenden Zug: abwarten, aber Referenz behalten,
+  // damit ein langsam sichtbar werdender Zug nicht verloren geht.
+  if (!changed.length) return { kind: 'weak' };
+  return { kind: 'unclear', changed, score: best?.score, margin };
+}
+
+const permute = (arr, perm, width) => {
+  const out = new Float32Array(arr.length);
+  for (let s = 0; s < 64; s++) for (let c = 0; c < width; c++) out[s * width + c] = arr[perm[s] * width + c];
+  return out;
+};
+
+function detectMove(cur, ref) {
+  const d = squareDiffs(cur, ref);
+  const stats = squareStats(cur);
+  const res = matchMove(d, stats);
+  if (res.kind !== 'unclear') return res;
+  // Passt kein Zug, war vielleicht die Ausrichtung falsch geschätzt: die anderen 3 Drehungen prüfen.
+  let best = null;
+  for (const { o, perm } of orientationPerms()) {
+    if (o === S.a1) continue;
+    const r = matchMove(permute(d, perm, 1), { mean: permute(stats.mean, perm, 3), tex: permute(stats.tex, perm, 1) });
+    if (r.kind === 'move' && (!best || r.score > best.score)) best = { ...r, orientation: o };
+  }
+  // Nur bei sehr eindeutigem Treffer umdrehen, sonst lieber nachfragen
+  return best && best.reliable && best.score > 2 && best.margin > 0.8 ? best : res;
 }
 
 function trackStep(img) {
@@ -300,19 +427,17 @@ function trackStep(img) {
   if (!S.prev) { S.prev = cur; return; }
   const motion = squareDiffs(cur, S.prev);
   S.prev = cur;
-  const moving = Math.max(...motion) > 12;
-  if (moving) {
-    S.stable = 0; S.evaluated = false;
-    setStatus('Bewegung erkannt …', 'busy');
-    return;
-  }
+  const moving = Math.max(...motion) > Math.max(10, median(motion) * 3 + 6);
+  if (moving) { S.stable = 0; S.evaluated = false; return; }
   S.stable++;
-  if (S.stable < 4 || S.evaluated) return;
+  if (S.stable < 3 || S.evaluated) return;
   S.evaluated = true;
   if (!S.ref) { S.ref = cur; idleStatus(); return; }
 
-  const res = matchMove(squareDiffs(cur, S.ref));
+  const res = detectMove(cur, S.ref);
+  if (DEBUG) console.log('detect', res.kind, res.move?.san || '', res.score?.toFixed(2) || '', res.margin?.toFixed(2) || '', res.orientation ?? '');
   if (res.kind === 'none') { S.ref = cur; if (!S.unclear) idleStatus(); return; }
+  if (res.kind === 'weak') return;
   if (res.kind === 'camera') {
     setStatus('Kamera hat sich bewegt – suche Brett neu', 'warn');
     startSearch();
@@ -320,7 +445,13 @@ function trackStep(img) {
   }
   if (res.kind === 'unclear') {
     S.unclear = true;
-    setStatus('Zug nicht eindeutig – tippe Start- und Zielfeld an', 'warn');
+    setStatus('Zug nicht erkannt – tippe Start- und Zielfeld an', 'warn');
+    return;
+  }
+  if (res.orientation !== undefined) {
+    // Ausrichtung korrigieren; die Referenz gehört zur alten Beschriftung, also neu aufnehmen
+    setBoard(S.quad, res.orientation);
+    applyMove(res.move, features(img));
     return;
   }
   applyMove(res.move, cur);
@@ -331,13 +462,13 @@ function applyMove(m, cur) {
   if (!played) return;
   S.lastMove = played;
   S.ref = cur || null;
+  S.prev = cur || null;
   S.unclear = false;
   S.tapFrom = null;
   S.best = null;
   if (!cur) { S.stable = 0; S.evaluated = false; } // neue Referenz beim nächsten ruhigen Bild
   vibrate();
   idleStatus();
-  renderMini();
   requestSuggestion();
 }
 
@@ -355,7 +486,7 @@ function startEngine() {
   engine.worker.onmessage = (e) => {
     const line = String(e.data);
     if (line === 'readyok') { engine.ready = true; if (engine.next) go(engine.next); }
-    else if (line.startsWith('info') && line.includes(' pv ')) engine.info = line;
+    else if (line.startsWith('info') && line.includes(' pv ')) onInfo(line);
     else if (line.startsWith('bestmove')) onBestMove(line.split(' ')[1]);
   };
   engine.worker.onerror = (e) => console.error('Stockfish', e);
@@ -371,17 +502,32 @@ function go(fen) {
   engine.worker.postMessage('go movetime ' + S.thinkMs);
 }
 
+// Schon während Stockfish rechnet, den bisher besten Zug zeigen: so steht nach wenigen
+// Zehntelsekunden ein Vorschlag da, der danach höchstens noch präzisiert wird.
+function onInfo(line) {
+  engine.info = line;
+  if (engine.next || engine.fen !== S.game.fen()) return;
+  const depth = Number(line.match(/ depth (\d+)/)?.[1] || 0);
+  if (depth < 8) return;
+  const uci = line.match(/ pv (\S+)/)?.[1];
+  if (uci && (!S.best || S.best.uci !== uci)) setBest(uci, false);
+}
+
 function onBestMove(uci) {
   engine.busy = false;
   if (engine.next) { go(engine.next); return; }
   if (engine.fen !== S.game.fen() || !uci || uci === '(none)') return;
+  setBest(uci, true);
+}
+
+function setBest(uci, final) {
   const probe = new Chess(engine.fen);
-  const m = probe.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || 'q' });
+  let m;
+  try { m = probe.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || 'q' }); } catch { return; }
   if (!m) return;
-  S.best = { from: m.from, to: m.to, san: m.san, piece: m.piece, color: m.color, promotion: m.promotion };
-  S.evalText = describeEval(engine.info, probe.turn() === 'w' ? 'b' : 'w');
+  S.best = { uci, from: m.from, to: m.to, san: m.san, piece: m.piece, color: m.color, promotion: m.promotion, final };
+  S.evalText = describeEval(engine.info, m.color);
   renderSuggestion();
-  renderMini();
   if (!S.unclear) idleStatus();
 }
 
@@ -396,7 +542,8 @@ function describeEval(info, side) {
   }
   if (cp) {
     const v = (Number(cp[1]) * sign) / 100;
-    return `Bewertung ${v > 0 ? '+' : ''}${v.toFixed(1).replace('.', ',')} (aus Sicht von Weiß)`;
+    if (Math.abs(v) < 0.3) return 'Stellung ausgeglichen';
+    return `${v > 0 ? 'Weiß' : 'Schwarz'} steht besser (${v > 0 ? '+' : ''}${v.toFixed(1).replace('.', ',')})`;
   }
   return '';
 }
@@ -404,13 +551,13 @@ function describeEval(info, side) {
 function requestSuggestion() {
   S.best = null;
   const g = S.game;
+  $('#btnUndo').hidden = g.history().length === 0;
   if (g.isGameOver()) {
-    S.best = null;
     renderSuggestion(g.isCheckmate() ? `Schachmatt – ${g.turn() === 'w' ? 'Schwarz' : 'Weiß'} gewinnt` : 'Remis');
     return;
   }
   if (S.myColor !== 'both' && g.turn() !== S.myColor) {
-    renderSuggestion('Gegner ist am Zug');
+    renderSuggestion(`Warte auf den Zug von ${g.turn() === 'w' ? 'Weiß' : 'Schwarz'}`);
     return;
   }
   renderSuggestion('Stockfish rechnet …');
@@ -419,59 +566,44 @@ function requestSuggestion() {
 
 /* ---------- Anzeige ---------- */
 
+// Die Statuszeile erscheint nur, wenn etwas zu tun ist; im Normalbetrieb bleibt das Bild frei.
 function setStatus(text, tone = 'idle') {
   $('#statusText').textContent = text;
   $('#status').dataset.tone = tone;
+  $('#status').hidden = tone === 'ok';
 }
 
-function idleStatus() {
-  const turn = S.game.turn() === 'w' ? 'Weiß' : 'Schwarz';
-  setStatus(`Brett erkannt · ${turn} am Zug`, 'ok');
+function idleStatus() { setStatus('', 'ok'); }
+
+function moveText(b) {
+  if (b.san.startsWith('O-O-O')) return 'Lange Rochade';
+  if (b.san.startsWith('O-O')) return 'Kurze Rochade';
+  let t = `${PIECE_DE[b.piece]} ${b.from} → ${b.to}`;
+  if (b.san.includes('x')) t += ' (schlägt)';
+  if (b.promotion) t += ', wird Dame';
+  return t;
 }
 
 function renderSuggestion(placeholder) {
-  const label = $('#sugLabel'), move = $('#sugMove'), meta = $('#sugMeta');
-  const turn = S.game.turn() === 'w' ? 'Weiß' : 'Schwarz';
+  const panel = $('#panel'), move = $('#sugMove'), meta = $('#sugMeta');
   if (S.best) {
-    const b = S.best;
-    label.textContent = `Empfehlung für ${turn}`;
-    let text = `${PIECE_DE[b.piece]} ${b.from} → ${b.to}`;
-    if (b.san.startsWith('O-O-O')) text = 'Lange Rochade';
-    else if (b.san.startsWith('O-O')) text = 'Kurze Rochade';
-    if (b.promotion) text += ' (Umwandlung in Dame)';
-    move.textContent = text;
-    meta.textContent = [b.san, S.evalText].filter(Boolean).join(' · ');
+    panel.dataset.tone = 'move';
+    move.textContent = moveText(S.best);
+    meta.textContent = [S.best.san.includes('+') ? 'Schach!' : '', S.evalText].filter(Boolean).join(' · ');
   } else {
-    label.textContent = `${turn} am Zug`;
+    panel.dataset.tone = 'wait';
     move.textContent = placeholder || '–';
     meta.textContent = S.lastMove ? `Letzter Zug: ${S.lastMove.san}` : '';
   }
 }
 
-function renderMini() {
-  const el = $('#mini');
-  const flip = S.myColor === 'b';
-  const board = S.game.board(); // board[0] = Reihe 8
-  const hl = new Set(S.best ? [S.best.from, S.best.to] : []);
-  let html = '';
-  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
-    const row = flip ? 7 - r : r, col = flip ? 7 - c : c;
-    const p = board[row][col];
-    const name = FILES[col] + (8 - row);
-    const dark = (row + col) % 2 === 1;
-    const cls = [dark ? 'd' : 'l', hl.has(name) ? 'hl' : '', p && p.color === 'w' ? 'w' : ''].join(' ');
-    html += `<div class="${cls}">${p ? GLYPH[p.type] : ''}</div>`;
-  }
-  el.innerHTML = html;
-}
-
 function vibrate() { try { navigator.vibrate?.(30); } catch { /* iOS kennt das nicht */ } }
 
-// Abbildung work-Koordinaten -> Bildschirm (Video ist mit object-fit: cover skaliert).
+// Abbildung work-Koordinaten -> Bildschirm (Video ist mit object-fit: contain skaliert).
 function viewMap() {
   const cw = overlay.clientWidth, ch = overlay.clientHeight;
   const ww = work.width || 1, wh = work.height || 1;
-  const s = Math.max(cw / ww, ch / wh);
+  const s = Math.min(cw / ww, ch / wh);
   return { s, ox: (cw - ww * s) / 2, oy: (ch - wh * s) / 2 };
 }
 const toScreen = (p, vm) => [vm.ox + p[0] * vm.s, vm.oy + p[1] * vm.s];
@@ -493,7 +625,7 @@ function draw(t) {
   requestAnimationFrame(draw);
   const dpr = window.devicePixelRatio || 1;
   const cw = overlay.clientWidth, ch = overlay.clientHeight;
-  if (overlay.width !== Math.round(cw * dpr)) { overlay.width = Math.round(cw * dpr); overlay.height = Math.round(ch * dpr); }
+  if (overlay.width !== Math.round(cw * dpr) || overlay.height !== Math.round(ch * dpr)) { overlay.width = Math.round(cw * dpr); overlay.height = Math.round(ch * dpr); }
   octx.setTransform(dpr, 0, 0, dpr, 0, 0);
   octx.clearRect(0, 0, cw, ch);
   const vm = viewMap();
@@ -514,35 +646,14 @@ function draw(t) {
   }
 
   if ((S.mode === 'track' || S.mode === 'adjust') && S.H) {
-    // Brett umranden: leuchtende Kontur mit umlaufendem Lichtstreifen
-    const outline = [[0, 0], [8, 0], [8, 8], [0, 8]].map(([u, v]) => boardToScreen(u, v, vm));
+    // Brett umranden: dezente leuchtende Kontur
+    const outline = BOARD_CORNERS.map(([u, v]) => boardToScreen(u, v, vm));
     octx.save();
-    octx.shadowColor = cBoard; octx.shadowBlur = 16;
-    octx.lineWidth = 3; octx.strokeStyle = cBoard; octx.globalAlpha = 0.75;
+    octx.shadowColor = cBoard; octx.shadowBlur = 14;
+    octx.lineWidth = 2.5; octx.strokeStyle = cBoard; octx.globalAlpha = 0.7;
     polyPath(outline); octx.stroke();
-    octx.globalAlpha = 1; octx.lineWidth = 4; octx.setLineDash([40, 400]); octx.lineDashOffset = -(t / 8) % 440;
-    octx.strokeStyle = '#ffffff'; polyPath(outline); octx.stroke();
     octx.restore();
 
-    // feines Raster
-    octx.lineWidth = 1; octx.strokeStyle = 'rgba(127,211,255,0.22)';
-    octx.beginPath();
-    for (let i = 1; i < 8; i++) {
-      let [x, y] = boardToScreen(i, 0, vm); octx.moveTo(x, y); [x, y] = boardToScreen(i, 8, vm); octx.lineTo(x, y);
-      [x, y] = boardToScreen(0, i, vm); octx.moveTo(x, y); [x, y] = boardToScreen(8, i, vm); octx.lineTo(x, y);
-    }
-    octx.stroke();
-
-    // Ecke a1 markieren, damit man die Ausrichtung prüfen kann
-    const [ax, ay] = boardToScreen(0.5, 0.5, vm);
-    octx.fillStyle = 'rgba(13,16,20,.7)'; octx.beginPath(); octx.arc(ax, ay, 11, 0, 7); octx.fill();
-    octx.fillStyle = cBoard; octx.font = '600 11px -apple-system, sans-serif'; octx.textAlign = 'center'; octx.textBaseline = 'middle';
-    octx.fillText('a1', ax, ay);
-
-    if (S.lastMove && !S.best) {
-      octx.fillStyle = 'rgba(127,211,255,0.18)';
-      [S.lastMove.from, S.lastMove.to].forEach((n) => { polyPath(squarePoly(n, vm, 0.04)); octx.fill(); });
-    }
     if (S.tapFrom) {
       octx.fillStyle = 'rgba(127,211,255,0.45)';
       polyPath(squarePoly(S.tapFrom, vm, 0.04)); octx.fill();
@@ -550,6 +661,14 @@ function draw(t) {
     if (S.best) drawBest(t, vm, cMove);
 
     if (S.mode === 'adjust') {
+      // Raster nur beim Anpassen der Ecken, damit man die Felder ausrichten kann
+      octx.lineWidth = 1; octx.strokeStyle = 'rgba(127,211,255,0.45)';
+      octx.beginPath();
+      for (let i = 1; i < 8; i++) {
+        let [x, y] = boardToScreen(i, 0, vm); octx.moveTo(x, y); [x, y] = boardToScreen(i, 8, vm); octx.lineTo(x, y);
+        [x, y] = boardToScreen(0, i, vm); octx.moveTo(x, y); [x, y] = boardToScreen(8, i, vm); octx.lineTo(x, y);
+      }
+      octx.stroke();
       S.quad.forEach((p) => {
         const [x, y] = toScreen(p, vm);
         octx.fillStyle = 'rgba(13,16,20,.6)'; octx.beginPath(); octx.arc(x, y, 18, 0, 7); octx.fill();
@@ -564,9 +683,10 @@ function drawBest(t, vm, color) {
   const pulse = 0.5 + 0.5 * Math.sin(t / 260);
   octx.save();
   octx.fillStyle = color;
-  octx.globalAlpha = 0.28; polyPath(squarePoly(b.from, vm, 0.04)); octx.fill();
+  octx.globalAlpha = 0.3; polyPath(squarePoly(b.from, vm, 0.04)); octx.fill();
   octx.globalAlpha = 0.35 + 0.3 * pulse; polyPath(squarePoly(b.to, vm, 0.04)); octx.fill();
   octx.globalAlpha = 1; octx.lineWidth = 2; octx.strokeStyle = color;
+  polyPath(squarePoly(b.from, vm, 0.04)); octx.stroke();
   polyPath(squarePoly(b.to, vm, 0.04)); octx.stroke();
 
   // Pfeil liegt in der Brettebene; Springer laufen über die L-Form.
@@ -580,7 +700,6 @@ function drawBest(t, vm, color) {
   const pts = path.map(([u, v]) => boardToScreen(u, v, vm));
   const sqPx = Math.hypot(...[0, 1].map((k) => boardToScreen(to[0] + 0.5, to[1], vm)[k] - boardToScreen(to[0] - 0.5, to[1], vm)[k]));
   const w = Math.max(5, sqPx * 0.16);
-  // Ende etwas vor der Feldmitte, damit die Spitze sitzt
   const [px, py] = pts[pts.length - 2], [ex, ey] = pts[pts.length - 1];
   const ang = Math.atan2(ey - py, ex - px);
   const head = w * 2.4;
@@ -614,6 +733,16 @@ function drawBest(t, vm, color) {
   octx.fillStyle = '#1b1405'; octx.font = `${Math.round(r * 0.95)}px -apple-system, "Segoe UI Symbol", sans-serif`;
   octx.textAlign = 'center'; octx.textBaseline = 'middle';
   octx.fillText(GLYPH[b.piece], ex, topY + r * 0.05);
+  // Feldnamen direkt über der Markierung, damit man nicht nach unten schauen muss
+  const label = `${b.from}→${b.to}`;
+  octx.font = `700 ${Math.round(Math.max(13, r * 0.55))}px -apple-system, sans-serif`;
+  const lw = octx.measureText(label).width + 12, lh = Math.max(20, r * 0.8), ly = topY - r - lh - 4;
+  octx.fillStyle = 'rgba(13,16,20,.8)';
+  octx.beginPath();
+  if (octx.roundRect) octx.roundRect(ex - lw / 2, ly, lw, lh, 6); else octx.rect(ex - lw / 2, ly, lw, lh);
+  octx.fill();
+  octx.fillStyle = color;
+  octx.fillText(label, ex, ly + lh / 2);
   octx.restore();
 }
 
@@ -633,7 +762,7 @@ function drawDebug(img) {
 
 function loop(t) {
   requestAnimationFrame(loop);
-  const interval = S.mode === 'search' ? 250 : 180;
+  const interval = S.mode === 'search' ? 220 : 140;
   if (t - S.lastTick < interval) return;
   S.lastTick = t;
   if (S.mode !== 'search' && S.mode !== 'track') return;
@@ -645,23 +774,24 @@ function loop(t) {
   } catch (e) { console.error(e); }
 }
 
+function resetTracking() { S.ref = null; S.prev = null; S.stable = 0; S.evaluated = false; S.unclear = false; }
+
 function startSearch() {
-  S.mode = 'search'; S.cand = null; S.candHits = 0; S.ref = null; S.prev = null;
+  S.mode = 'search'; S.cand = null; S.candHits = 0; resetTracking();
   setStatus('Suche Schachbrett …', 'search');
 }
 
 function enterTrack() {
-  S.mode = 'track'; S.ref = null; S.prev = null; S.stable = 0; S.evaluated = false; S.unclear = false;
-  $('#panel').hidden = false; $('#mini').hidden = false;
-  idleStatus(); renderMini();
+  S.mode = 'track'; resetTracking();
+  $('#panel').hidden = false;
+  idleStatus();
   requestSuggestion();
 }
 
 async function startCamera(deviceId) {
   S.stream?.getTracks().forEach((t) => t.stop());
-  const video0 = deviceId
-    ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-    : { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } };
+  const size = { width: { ideal: 1280 }, height: { ideal: 720 } };
+  const video0 = deviceId ? { deviceId: { exact: deviceId }, ...size } : { facingMode: { ideal: 'environment' }, ...size };
   S.stream = await navigator.mediaDevices.getUserMedia({ video: video0, audio: false });
   video.srcObject = S.stream;
   await video.play().catch(() => {});
@@ -711,6 +841,7 @@ overlay.addEventListener('pointerdown', (e) => {
   if (S.mode === 'adjust') {
     S.drag = S.quad.findIndex((q) => Math.hypot(q[0] - p[0], q[1] - p[1]) * vm.s < 40);
     if (S.drag >= 0) overlay.setPointerCapture(e.pointerId);
+    else { S.mode = 'track'; resetTracking(); idleStatus(); }
     return;
   }
   if (S.mode === 'track' && S.Hinv) {
@@ -734,6 +865,8 @@ overlay.addEventListener('pointermove', (e) => {
 });
 overlay.addEventListener('pointerup', () => { S.drag = -1; });
 
+const closeSettings = () => { $('#settings').hidden = true; };
+
 $('#btnStart').addEventListener('click', async () => {
   S.myColor = $('#introColor').value;
   $('#colorSelect').value = S.myColor;
@@ -743,7 +876,7 @@ $('#btnStart').addEventListener('click', async () => {
   } catch (e) {
     $('#introMsg').textContent = window.isSecureContext
       ? 'Kein Kamerazugriff. Erlaube die Kamera in den Browser-Einstellungen und lade die Seite neu.'
-      : 'Die Kamera funktioniert nur über https:// – öffne die App über lars-mst.github.io/schach-kamera.';
+      : 'Die Kamera funktioniert nur über https:// – öffne die App über lars-mst.github.io/schach-kamera';
     return;
   }
   $('#intro').hidden = true;
@@ -751,10 +884,10 @@ $('#btnStart').addEventListener('click', async () => {
 });
 
 $('#btnSettings').addEventListener('click', () => { $('#fenInput').value = S.game.fen(); $('#settings').hidden = false; });
-$('#btnClose').addEventListener('click', () => { $('#settings').hidden = true; });
-$('#settings').addEventListener('click', (e) => { if (e.target.id === 'settings') $('#settings').hidden = true; });
+$('#btnClose').addEventListener('click', closeSettings);
+$('#settings').addEventListener('click', (e) => { if (e.target.id === 'settings') closeSettings(); });
 $('#camSelect').addEventListener('change', async (e) => { await startCamera(e.target.value); startSearch(); });
-$('#colorSelect').addEventListener('change', (e) => { S.myColor = e.target.value; renderMini(); requestSuggestion(); });
+$('#colorSelect').addEventListener('change', (e) => { S.myColor = e.target.value; requestSuggestion(); });
 $('#thinkSelect').addEventListener('change', (e) => { S.thinkMs = Number(e.target.value); });
 $('#btnFen').addEventListener('click', () => {
   try {
@@ -763,15 +896,15 @@ $('#btnFen').addEventListener('click', () => {
     $('#fenInput').setCustomValidity('Ungültige FEN'); $('#fenInput').reportValidity(); return;
   }
   $('#fenInput').setCustomValidity('');
-  S.lastMove = null; S.ref = null; S.stable = 0; S.evaluated = false; S.unclear = false;
-  renderMini(); requestSuggestion(); $('#settings').hidden = true;
+  S.lastMove = null; resetTracking();
+  requestSuggestion(); closeSettings();
 });
 $('#btnNew').addEventListener('click', () => {
-  S.game = new Chess(); S.lastMove = null; S.ref = null; S.stable = 0; S.evaluated = false; S.unclear = false;
-  renderMini(); requestSuggestion(); $('#settings').hidden = true;
+  S.game = new Chess(); S.lastMove = null; resetTracking();
+  requestSuggestion(); closeSettings();
 });
 $('#btnManual').addEventListener('click', () => {
-  $('#settings').hidden = true;
+  closeSettings();
   if (!S.stream) return;
   S.mode = 'manual'; S.manualPts = [];
   setStatus('Tippe die 4 Ecken der Spielfläche an', 'search');
@@ -780,25 +913,23 @@ $('#btnUndo').addEventListener('click', () => {
   if (!S.game.undo()) return;
   const h = S.game.history({ verbose: true });
   S.lastMove = h[h.length - 1] || null;
-  S.ref = null; S.stable = 0; S.evaluated = false; S.unclear = false;
-  renderMini(); requestSuggestion();
+  resetTracking();
+  requestSuggestion();
 });
 $('#btnRotate').addEventListener('click', () => {
+  closeSettings();
   if (!S.quad) return;
   setBoard(S.quad, (S.a1 + 1) % 4);
-  S.ref = null; S.prev = null; S.stable = 0; S.evaluated = false;
+  resetTracking();
+  requestSuggestion();
 });
-$('#btnAdjust').addEventListener('click', (e) => {
+$('#btnAdjust').addEventListener('click', () => {
+  closeSettings();
   if (!S.quad) return;
-  if (S.mode === 'adjust') {
-    S.mode = 'track'; e.target.classList.remove('on'); e.target.textContent = 'Ecken anpassen';
-    S.ref = null; S.prev = null; S.stable = 0; S.evaluated = false; idleStatus();
-  } else {
-    S.mode = 'adjust'; e.target.classList.add('on'); e.target.textContent = 'Fertig';
-    setStatus('Ziehe die Ecken auf die Ecken der Spielfläche', 'search');
-  }
+  S.mode = 'adjust';
+  setStatus('Ecken ziehen · daneben tippen zum Beenden', 'search');
 });
-$('#btnRedetect').addEventListener('click', () => { S.best = null; startSearch(); });
+$('#btnRedetect').addEventListener('click', () => { closeSettings(); S.best = null; startSearch(); });
 
 window.addEventListener('pagehide', () => S.stream?.getTracks().forEach((t) => t.stop()));
 
