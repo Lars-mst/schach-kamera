@@ -1,6 +1,7 @@
 // Schach Kamera: Brett finden (OpenCV), Züge über Feld-Veränderungen erkennen (chess.js),
 // besten Zug berechnen (Stockfish WASM) und perspektivisch korrekt ins Kamerabild zeichnen.
 import { Chess } from './lib/chess.js';
+import { CLASSES, ColorModel, TemplateStore, classMap, colorFeatures, cropPatch, loadModel, saveModel, forgetModel, assignTypes, toFen, plausibility } from './vision.js';
 
 const $ = (s) => document.querySelector(s);
 const video = $('#video');
@@ -41,7 +42,25 @@ const S = {
   drag: -1,
   cv: null,
   lastTick: 0,
+  tick: 0,
+  fresh: true,           // noch keine Partie begonnen: beim Finden des Bretts Stellung bestimmen
+  outerT: null,          // Einzug des Rasters im gefundenen Brettumriss (für das Nachführen)
+  camMoving: false,
+  model: null,           // Farbmodell leer/weiß/schwarz
+  templates: null,       // Figurenvorlagen
+  needLearn: false,      // nächste ruhige, passende Aufnahme zum Lernen nutzen
+  mismatch: [],          // Felder, die nicht zur Stellung passen
+  badStreak: 0,
+  inconsistent: false,
+  notice: null,          // { text, until }
+  scan: null,            // offene Scan-Bestätigung
+  searchKey: null,       // zuletzt erfolglos durchsuchte Abweichung
 };
+{
+  const m = loadModel();
+  S.model = m?.color || new ColorModel();
+  S.templates = m?.templates || new TemplateStore();
+}
 window.__S = S; // für Tests / Debugging
 
 /* ---------- Geometrie ---------- */
@@ -190,11 +209,14 @@ function findQuads(img) {
 
 // Der gefundene Umriss ist oft der Brettrand mit Koordinaten. Wir suchen den Einzug t,
 // bei dem die mittleren 4x4 Felder (in der Grundstellung leer) das klarste Schachmuster zeigen.
-function refineGrid(img, quad) {
+function refineGrid(img, quad, fixedT = null) {
   const Hq = homography([[0, 0], [1, 0], [1, 1], [0, 1]], quad);
   if (!Hq) return null;
   const results = [];
-  for (let t = 0; t <= 0.16; t += 0.005) {
+  const ts = [];
+  if (fixedT === null) for (let t = 0; t <= 0.16; t += 0.005) ts.push(t);
+  else ts.push(Math.max(0, fixedT - 0.005), fixedT, fixedT + 0.005);
+  for (const t of ts) {
     const sz = (1 - 2 * t) / 8;
     const sums = [0, 0], sds = [];
     for (let i = 2; i < 6; i++) for (let j = 2; j < 6; j++) {
@@ -244,10 +266,67 @@ function searchStep(img) {
   S.candHits = close ? S.candHits + 1 : 1;
   S.cand = found;
   setStatus('Schachbrett gefunden … halte still', 'search');
-  if (S.candHits >= 3) {
-    setBoard(found.grid, guessOrientation(img, found.grid, found.darkParity));
+  if (S.candHits >= 3) onBoardLocked(img, found);
+}
+
+// Brett ist gefunden: Ausrichtung und Stellung festlegen
+function onBoardLocked(img, found) {
+  if (!S.fresh && S.quad) {
+    // Brett nach Kamerabewegung wiedergefunden: Ausrichtung beibehalten, Partie weiterführen
+    setBoard(alignQuad(found.grid, S.quad), S.a1);
+    S.outerT = found.t;
     enterTrack();
+    return;
   }
+  S.fresh = false;
+  S.outerT = found.t;
+  setBoard(found.grid, guessOrientation(img, found.grid, found.darkParity));
+  if (S.model.ready && S.templates.ready) {
+    const scan = scanPosition(img);
+    if (scan) {
+      setBoard(S.quad, scan.o);
+      enterTrack();
+      if (toFen(scan.pieces, 'w').split(' ')[0] === new Chess().fen().split(' ')[0]) { S.game = new Chess(); S.needLearn = true; requestSuggestion(); }
+      else openScanDialog(scan);
+      return;
+    }
+  }
+  enterTrack();
+  if (!startLooksRight(img)) setStatus('Keine Grundstellung erkannt – Grundstellung aufbauen oder im Zahnrad die Stellung eingeben', 'warn');
+}
+
+function startLooksRight(img) {
+  const { occ, reliable } = occupancy(squareStats(features(img)), new Chess());
+  if (!reliable) return false;
+  let ok = 0;
+  for (let sq = 0; sq < 64; sq++) if ((sq < 16 || sq >= 48) === occ[sq] > 0.5) ok++;
+  return ok >= 54;
+}
+
+// Ecken eines neu gefundenen Umrisses in dieselbe Reihenfolge wie die bisherigen bringen
+function alignQuad(grid, old) {
+  let bestK = 0, bestD = Infinity;
+  for (let k = 0; k < 4; k++) {
+    let d = 0;
+    for (let i = 0; i < 4; i++) d += Math.hypot(grid[(i + k) % 4][0] - old[i][0], grid[(i + k) % 4][1] - old[i][1]);
+    if (d < bestD) { bestD = d; bestK = k; }
+  }
+  return [0, 1, 2, 3].map((i) => grid[(i + bestK) % 4]);
+}
+
+// Brett während der Partie nachführen (Kamera bewegt sich). Gibt true zurück, wenn die Lage aktualisiert wurde.
+function followBoard(img) {
+  let found = null;
+  for (const q of findQuads(img)) {
+    const r = refineGrid(img, q.pts, S.outerT ?? null);
+    if (r && r.contrast > 15 && r.score > 0 && (!found || r.score > found.score)) found = r;
+  }
+  if (!found) return false;
+  const aligned = alignQuad(found.grid, S.quad);
+  const shift = Math.max(...aligned.map((p, i) => Math.hypot(p[0] - S.quad[i][0], p[1] - S.quad[i][1])));
+  if (shift < img.width * 0.006) return false;
+  setBoard(aligned, S.a1);
+  return true;
 }
 
 /* ---------- Züge erkennen ---------- */
@@ -409,7 +488,8 @@ function detectMove(cur, ref) {
   const d = squareDiffs(cur, ref);
   const stats = squareStats(cur);
   const res = matchMove(d, stats);
-  if (res.kind !== 'unclear') return res;
+  // Nach den ersten Zügen steht die Ausrichtung fest; dann nie mehr umdrehen
+  if (res.kind !== 'unclear' || S.game.history().length >= 6) return res;
   // Passt kein Zug, war vielleicht die Ausrichtung falsch geschätzt: die anderen 3 Drehungen prüfen.
   let best = null;
   for (const { o, perm } of orientationPerms()) {
@@ -422,30 +502,54 @@ function detectMove(cur, ref) {
 }
 
 function trackStep(img) {
-  const cur = features(img);
+  S.tick++;
+  const cur0 = features(img);
   if (DEBUG) drawDebug(img);
-  if (!S.prev) { S.prev = cur; return; }
-  const motion = squareDiffs(cur, S.prev);
+  if (!S.prev) { S.prev = cur0; return; }
+  const motion = squareDiffs(cur0, S.prev);
+  // Bewegt sich das ganze Bild, hat sich die Kamera bewegt (nicht nur eine Hand über dem Brett)
+  const globalMotion = median(motion) > 9;
+  if (globalMotion) {
+    S.camMoving = true;
+    if (S.cv && S.tick % 2 === 0) followBoard(img);
+    S.prev = features(img); S.stable = 0; S.evaluated = false; S.ref = null;
+    return;
+  }
+  if (S.camMoving) {
+    // Kamera steht wieder: Brett genau nachführen; was in der Zwischenzeit gezogen wurde,
+    // findet der Abgleich mit der Stellung.
+    S.camMoving = false;
+    if (S.cv) followBoard(img);
+    S.prev = features(img); S.stable = 0; S.evaluated = false; S.ref = null;
+    return;
+  }
+  const cur = cur0;
   S.prev = cur;
   const moving = Math.max(...motion) > Math.max(10, median(motion) * 3 + 6);
   if (moving) { S.stable = 0; S.evaluated = false; return; }
   S.stable++;
-  if (S.stable < 3 || S.evaluated) return;
+  if (S.stable < 3) return;
+  if (S.evaluated) {
+    // Passt die Stellung nicht, in Ruhe noch ein paar Mal nachsehen
+    if (S.badStreak > 0 && S.stable % 7 === 0) verifyPosition(img, cur);
+    return;
+  }
   S.evaluated = true;
-  if (!S.ref) { S.ref = cur; idleStatus(); return; }
+  if (!S.ref) { S.ref = cur; if (!verifyPosition(img, cur) && !S.inconsistent) idleStatus(); return; }
 
   const res = detectMove(cur, S.ref);
   if (DEBUG) console.log('detect', res.kind, res.move?.san || '', res.score?.toFixed(2) || '', res.margin?.toFixed(2) || '', res.orientation ?? '');
-  if (res.kind === 'none') { S.ref = cur; if (!S.unclear) idleStatus(); return; }
-  if (res.kind === 'weak') return;
+  if (res.kind === 'none') { S.ref = cur; if (!verifyPosition(img, cur) && !S.unclear && !S.inconsistent) idleStatus(); return; }
+  if (res.kind === 'weak') { verifyPosition(img, cur); return; }
   if (res.kind === 'camera') {
-    setStatus('Kamera hat sich bewegt – suche Brett neu', 'warn');
-    startSearch();
+    if (!(S.cv && followBoard(img))) { setStatus('Brett verloren – suche neu', 'warn'); startSearch(); }
+    S.ref = null; S.prev = null;
     return;
   }
   if (res.kind === 'unclear') {
+    if (verifyPosition(img, cur)) return;
     S.unclear = true;
-    setStatus('Zug nicht erkannt – tippe Start- und Zielfeld an', 'warn');
+    if (!S.inconsistent) setStatus('Zug nicht erkannt – tippe Start- und Zielfeld an', 'warn');
     return;
   }
   if (res.orientation !== undefined) {
@@ -461,15 +565,257 @@ function applyMove(m, cur) {
   const played = S.game.move({ from: m.from, to: m.to, promotion: 'q' });
   if (!played) return;
   S.lastMove = played;
+  afterPositionChange(cur);
+}
+
+function afterPositionChange(cur) {
   S.ref = cur || null;
   S.prev = cur || null;
   S.unclear = false;
+  S.inconsistent = false;
+  S.badStreak = 0;
+  S.mismatch = [];
   S.tapFrom = null;
   S.best = null;
-  if (!cur) { S.stable = 0; S.evaluated = false; } // neue Referenz beim nächsten ruhigen Bild
+  S.needLearn = true;
+  S.searchKey = null;
+  // Beim nächsten ruhigen Bild die neue Stellung mit dem Bild abgleichen (und daraus lernen)
+  S.evaluated = false;
+  if (!cur) S.stable = 0;
   vibrate();
   idleStatus();
   requestSuggestion();
+}
+
+/* ---------- Abgleich Bild <-> Stellung ---------- */
+
+const CI = { e: 0, w: 1, b: 2 };
+
+function cloneGame(game) {
+  const g = new Chess();
+  try { g.loadPgn(game.pgn()); return g; } catch { return new Chess(game.fen()); }
+}
+
+// Prüft, ob das Bild zur verfolgten Stellung passt. Passt es nicht, sucht es die Zugfolge
+// (bis zu 3 Halbzüge, auch mit Korrektur des letzten Zuges), die das Bild am besten erklärt.
+// Gibt true zurück, wenn die Stellung dabei geändert wurde.
+function verifyPosition(img, cur) {
+  if (!S.model.ready) {
+    if (S.needLearn && S.game.history().length) learn(img, cur);
+    return false;
+  }
+  const feats = colorFeatures(cur, PER);
+  const ll = S.model.logLik(feats);
+  const cls = classMap(S.game);
+  const mism = [];
+  for (let sq = 0; sq < 64; sq++) {
+    const row = [ll[sq * 3], ll[sq * 3 + 1], ll[sq * 3 + 2]];
+    if (Math.max(...row) - row[CI[cls[sq]]] > 5) mism.push(sq);
+  }
+  S.mismatch = mism;
+  if (!mism.length) {
+    S.badStreak = 0;
+    if (S.inconsistent) { S.inconsistent = false; idleStatus(); renderSuggestion(); requestSuggestion(); }
+    if (S.needLearn) learn(img, cur, feats);
+    return false;
+  }
+  S.badStreak++;
+  if (S.badStreak < 2) return false; // einmal abwarten: Hand, Schatten
+  // Dieselbe Abweichung nicht immer wieder durchsuchen
+  const key = S.game.fen() + '|' + mism.join(',');
+  let fix = null;
+  // Weichen mehr als 6 Felder ab, ist Neu-Einlesen sinnvoller als eine lange Suche
+  if (key !== S.searchKey && mism.length <= 6) {
+    const t0 = performance.now();
+    fix = searchSequence(ll, 3);
+    S.searchKey = fix ? null : key;
+    if (DEBUG) console.log('verify mismatch', mism.length, fix ? 'fix ' + (fix.undo ? 'undo+' : '') + fix.seq.map((m) => m.san).join(' ') : 'kein fix', Math.round(performance.now() - t0) + 'ms');
+  }
+  if (fix) {
+    if (fix.undo) S.game.undo();
+    for (const m of fix.seq) S.game.move({ from: m.from, to: m.to, promotion: 'q' });
+    const h = S.game.history({ verbose: true });
+    S.lastMove = h[h.length - 1] || null;
+    S.notice = { text: `Erkannt: ${fix.seq.map((m) => m.san).join(', ') || 'letzter Zug zurückgenommen'}`, until: performance.now() + 5000 };
+    afterPositionChange(cur);
+    return true;
+  }
+  if (mism.length >= 2 || S.badStreak >= 3) {
+    if (!S.inconsistent) {
+      S.inconsistent = true;
+      renderSuggestion();
+    }
+    setStatus('Stellung passt nicht zum Bild – hier tippen zum Neu-Einlesen', 'warn');
+  }
+  return false;
+}
+
+function searchSequence(ll, maxPly) {
+  const score = (g) => {
+    const c = classMap(g);
+    let s = 0;
+    for (let sq = 0; sq < 64; sq++) s += ll[sq * 3 + CI[c[sq]]];
+    return s;
+  };
+  const base = score(S.game);
+  const results = [];
+  const roots = [{ g: cloneGame(S.game), undo: 0, pen: 0 }];
+  if (S.game.history().length) { const g = cloneGame(S.game); g.undo(); roots.push({ g, undo: 1, pen: 1.5 }); }
+  const PLY = 2.5;
+  let nodes = 0;
+  for (const root of roots) {
+    // Nur Züge, die ein Feld berühren, das nicht zur Ausgangsstellung passt: hält die Suche
+    // auch bei drei Halbzügen klein genug fürs Handy.
+    const c0 = classMap(root.g);
+    const odd = new Set();
+    for (let sq = 0; sq < 64; sq++) {
+      const row = [ll[sq * 3], ll[sq * 3 + 1], ll[sq * 3 + 2]];
+      if (Math.max(...row) - row[CI[c0[sq]]] > 2) odd.add(sq);
+    }
+    const seq = [];
+    const dfs = (g, depth) => {
+      if (seq.length || root.undo) results.push({ s: score(g) - root.pen - PLY * seq.length, seq: [...seq], undo: root.undo, key: g.fen().split(' ')[0] });
+      if (!depth || ++nodes > 800) return;
+      for (const m of g.moves({ verbose: true })) {
+        if (m.promotion && m.promotion !== 'q') continue;
+        if (!involvedSquares(m).some(([sq]) => odd.has(sq))) continue;
+        g.move({ from: m.from, to: m.to, promotion: 'q' });
+        seq.push(m);
+        dfs(g, depth - 1);
+        seq.pop();
+        g.undo();
+      }
+    };
+    dfs(root.g, maxPly);
+  }
+  results.sort((a, b) => b.s - a.s);
+  const best = results[0];
+  if (!best || best.s - base < 4) return null;
+  const rival = results.find((r) => r.key !== best.key);
+  if (rival && best.s - rival.s < 2) return null;
+  return best;
+}
+
+// Aus einer bestätigten Stellung lernen: Farbmodell und Figurenvorlagen
+function learn(img, cur, feats) {
+  S.model.fit(feats || colorFeatures(cur, PER), classMap(S.game));
+  const proj = (u, v) => project(S.H, u, v);
+  const board = S.game.board();
+  for (let sq = 0; sq < 64; sq++) {
+    const p = board[7 - (sq >> 3)][sq % 8];
+    if (p) S.templates.add(p.color, p.type, cropPatch(img, proj, sq), isDark(sq));
+  }
+  S.needLearn = false;
+  saveModel(S.model, S.templates);
+  updateLearnInfo();
+}
+
+function updateLearnInfo() {
+  $('#learnInfo').textContent = S.model.ready && S.templates.ready
+    ? 'Dein Figurenset ist gelernt: Stellungen mitten in der Partie können eingelesen werden.'
+    : 'Noch kein Figurenset gelernt: einmal mit der Grundstellung starten und einen Zug spielen.';
+}
+
+/* ---------- Stellung einlesen ---------- */
+
+function scanPosition(img) {
+  if (!S.model.ready || !S.templates.ready || !S.H) return null;
+  const cur = features(img);
+  const ll = S.model.logLik(colorFeatures(cur, PER));
+  const cls = [];
+  for (let sq = 0; sq < 64; sq++) {
+    const row = [ll[sq * 3], ll[sq * 3 + 1], ll[sq * 3 + 2]];
+    cls.push(CLASSES[row.indexOf(Math.max(...row))]);
+  }
+  const proj = (u, v) => project(S.H, u, v);
+  const sims = new Map();
+  for (let sq = 0; sq < 64; sq++) if (cls[sq] !== 'e') sims.set(sq, S.templates.similarities(cls[sq], cropPatch(img, proj, sq), isDark(sq)));
+  // Die zuletzt verfolgte Stellung hilft beim Zuordnen: was dort stand, steht oft noch da
+  const prior = new Map();
+  if (S.game.history().length || S.game.fen() !== new Chess().fen()) {
+    const board = S.game.board();
+    for (let sq = 0; sq < 64; sq++) { const p = board[7 - (sq >> 3)][sq % 8]; if (p) prior.set(sq, p); }
+  }
+  let best = null;
+  // Nur die beiden Ausrichtungen, bei denen a1 dunkel ist
+  for (const { o, perm } of orientationPerms()) {
+    if (o !== S.a1 && o !== (S.a1 + 2) % 4) continue;
+    const cands = [];
+    for (let s = 0; s < 64; s++) if (cls[perm[s]] !== 'e') cands.push({ sq: s, color: cls[perm[s]], sims: sims.get(perm[s]) });
+    if (!cands.some((c) => c.color === 'w') || !cands.some((c) => c.color === 'b')) continue;
+    const pieces = assignTypes(cands, prior);
+    if (DEBUG && o === S.a1) console.log('verify-scan', cands.map((c) => FILES[c.sq % 8] + ((c.sq >> 3) + 1) + ':' + Object.entries(c.sims).sort((x, y) => y[1] - x[1]).slice(0, 2).map(([t, v]) => t + v.toFixed(2)).join('/')).join(' '));
+    let fit = 0;
+    for (const c of cands) fit += c.sims[pieces.get(c.sq).type];
+    const score = plausibility(pieces) + fit * 0.3;
+    if (!best || score > best.score) best = { o, pieces, score };
+  }
+  return best;
+}
+
+const PIECE_CYCLE = [null, ...['w', 'b'].flatMap((c) => ['p', 'n', 'b', 'r', 'q', 'k'].map((t) => ({ color: c, type: t })))];
+
+function openScanDialog(scan) {
+  S.scan = { o: scan.o, pieces: new Map(scan.pieces) };
+  $('#scanTurn').value = S.myColor === 'b' ? 'b' : 'w';
+  $('#scanMsg').textContent = 'Tippe auf ein Feld, um eine falsch erkannte Figur zu ändern.';
+  renderScanBoard();
+  $('#scan').hidden = false;
+}
+
+function renderScanBoard() {
+  const el = $('#scanBoard');
+  const flip = S.myColor === 'b';
+  let html = '';
+  for (let r = 7; r >= 0; r--) for (let f = 0; f < 8; f++) {
+    const rank = flip ? 7 - r : r, file = flip ? 7 - f : f;
+    const sq = file + 8 * rank;
+    const p = S.scan.pieces.get(sq);
+    html += `<div data-sq="${sq}" class="${(file + rank) % 2 === 0 ? 'd' : 'l'} ${p ? 'p' + p.color : ''}">${p ? GLYPH[p.type] : ''}</div>`;
+  }
+  el.innerHTML = html;
+}
+
+$('#scanBoard').addEventListener('click', (e) => {
+  const sq = Number(e.target.closest('[data-sq]')?.dataset.sq);
+  if (Number.isNaN(sq) || !S.scan) return;
+  const p = S.scan.pieces.get(sq);
+  const i = PIECE_CYCLE.findIndex((c) => (c === null ? !p : p && c.color === p.color && c.type === p.type));
+  const next = PIECE_CYCLE[(i + 1) % PIECE_CYCLE.length];
+  if (next) S.scan.pieces.set(sq, next); else S.scan.pieces.delete(sq);
+  renderScanBoard();
+});
+
+$('#btnScanOk').addEventListener('click', () => {
+  if (!S.scan) return;
+  const fen = toFen(S.scan.pieces, $('#scanTurn').value);
+  let g;
+  try { g = new Chess(fen); } catch (err) {
+    $('#scanMsg').textContent = 'Diese Stellung ist so nicht möglich (z. B. König fehlt oder der Gegner steht im Schach). Bitte korrigieren.';
+    return;
+  }
+  setBoard(S.quad, S.scan.o);
+  S.game = g; S.lastMove = null; S.scan = null;
+  $('#scan').hidden = true;
+  resetTracking();
+  S.inconsistent = false; S.mismatch = []; S.needLearn = true;
+  idleStatus();
+  requestSuggestion();
+});
+$('#btnScanRetry').addEventListener('click', () => {
+  const scan = scanPosition(grab());
+  if (scan) openScanDialog(scan); else $('#scanMsg').textContent = 'Brett gerade nicht gut zu sehen. Hand weg und nochmal versuchen.';
+});
+$('#btnScanCancel').addEventListener('click', () => { S.scan = null; $('#scan').hidden = true; });
+
+function startScan() {
+  if (!S.quad) { setStatus('Erst muss das Brett erkannt sein', 'warn'); return; }
+  if (!S.model.ready || !S.templates.ready) {
+    setStatus('Noch kein Figurenset gelernt – einmal mit Grundstellung starten', 'warn');
+    return;
+  }
+  const scan = scanPosition(grab());
+  if (scan) openScanDialog(scan);
 }
 
 /* ---------- Stockfish ---------- */
@@ -586,14 +932,23 @@ function moveText(b) {
 
 function renderSuggestion(placeholder) {
   const panel = $('#panel'), move = $('#sugMove'), meta = $('#sugMeta');
+  if (S.inconsistent) {
+    // Lieber nichts empfehlen als einen Zug aus einer falschen Stellung
+    panel.dataset.tone = 'wait';
+    move.textContent = 'Stellung passt nicht zum Bild';
+    meta.textContent = 'Orange Felder prüfen oder oben tippen zum Neu-Einlesen';
+    return;
+  }
+  const notice = S.notice && S.notice.until > performance.now() ? S.notice.text : '';
   if (S.best) {
     panel.dataset.tone = 'move';
     move.textContent = moveText(S.best);
-    meta.textContent = [S.best.san.includes('+') ? 'Schach!' : '', S.evalText].filter(Boolean).join(' · ');
+    meta.textContent = [notice, S.best.san.includes('+') ? 'Schach!' : '', S.evalText].filter(Boolean).join(' · ');
   } else {
     panel.dataset.tone = 'wait';
-    move.textContent = placeholder || '–';
-    meta.textContent = S.lastMove ? `Letzter Zug: ${S.lastMove.san}` : '';
+    if (placeholder) S.placeholder = placeholder;
+    move.textContent = S.placeholder || '–';
+    meta.textContent = notice || (S.lastMove ? `Letzter Zug: ${S.lastMove.san}` : '');
   }
 }
 
@@ -623,6 +978,7 @@ function squarePoly(name, vm, inset = 0) {
 
 function draw(t) {
   requestAnimationFrame(draw);
+  if (S.notice && S.notice.until <= performance.now()) { S.notice = null; renderSuggestion(); }
   const dpr = window.devicePixelRatio || 1;
   const cw = overlay.clientWidth, ch = overlay.clientHeight;
   if (overlay.width !== Math.round(cw * dpr) || overlay.height !== Math.round(ch * dpr)) { overlay.width = Math.round(cw * dpr); overlay.height = Math.round(ch * dpr); }
@@ -654,11 +1010,24 @@ function draw(t) {
     polyPath(outline); octx.stroke();
     octx.restore();
 
+    drawPieces(vm);
+    if (S.mismatch.length && S.badStreak >= 2) {
+      octx.save();
+      octx.fillStyle = css.getPropertyValue('--warn').trim();
+      octx.strokeStyle = octx.fillStyle; octx.lineWidth = 2;
+      for (const sq of S.mismatch) {
+        const poly = squarePoly(FILES[sq % 8] + ((sq >> 3) + 1), vm, 0.06);
+        octx.globalAlpha = 0.25; polyPath(poly); octx.fill();
+        octx.globalAlpha = 0.9; polyPath(poly); octx.stroke();
+      }
+      octx.restore();
+    }
+
     if (S.tapFrom) {
       octx.fillStyle = 'rgba(127,211,255,0.45)';
       polyPath(squarePoly(S.tapFrom, vm, 0.04)); octx.fill();
     }
-    if (S.best) drawBest(t, vm, cMove);
+    if (S.best && !S.inconsistent) drawBest(t, vm, cMove);
 
     if (S.mode === 'adjust') {
       // Raster nur beim Anpassen der Ecken, damit man die Felder ausrichten kann
@@ -676,6 +1045,28 @@ function draw(t) {
       });
     }
   }
+}
+
+// Jede bekannte Figur bekommt einen Ring, der flach auf ihrem Feld liegt (perspektivisch
+// mit der Brettebene verzerrt), damit man sieht, was die App wo vermutet.
+const RING = Array.from({ length: 28 }, (_, i) => [Math.cos((i / 28) * Math.PI * 2), Math.sin((i / 28) * Math.PI * 2)]);
+function drawPieces(vm) {
+  const board = S.game.board();
+  octx.save();
+  octx.lineWidth = 2;
+  for (let r = 0; r < 8; r++) for (let f = 0; f < 8; f++) {
+    const p = board[7 - r][f];
+    if (!p) continue;
+    const pts = RING.map(([c, s]) => boardToScreen(f + 0.5 + c * 0.36, r + 0.5 + s * 0.36, vm));
+    polyPath(pts);
+    if (p.color === 'w') {
+      octx.strokeStyle = 'rgba(255,255,255,0.8)'; octx.stroke();
+    } else {
+      octx.strokeStyle = 'rgba(255,255,255,0.35)'; octx.lineWidth = 4; octx.stroke();
+      octx.strokeStyle = 'rgba(20,24,30,0.9)'; octx.lineWidth = 2; octx.stroke();
+    }
+  }
+  octx.restore();
 }
 
 function drawBest(t, vm, color) {
@@ -883,7 +1274,18 @@ $('#btnStart').addEventListener('click', async () => {
   startSearch();
 });
 
-$('#btnSettings').addEventListener('click', () => { $('#fenInput').value = S.game.fen(); $('#settings').hidden = false; });
+$('#btnSettings').addEventListener('click', () => { $('#fenInput').value = S.game.fen(); updateLearnInfo(); $('#settings').hidden = false; });
+$('#btnScan').addEventListener('click', () => { closeSettings(); startScan(); });
+$('#btnForget').addEventListener('click', () => {
+  forgetModel();
+  S.model = new ColorModel(); S.templates = new TemplateStore();
+  S.needLearn = true; S.mismatch = []; S.badStreak = 0;
+  if (S.inconsistent) { S.inconsistent = false; idleStatus(); requestSuggestion(); }
+  updateLearnInfo();
+});
+const statusTap = () => { if (S.inconsistent) startScan(); };
+$('#status').addEventListener('click', statusTap);
+$('#status').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') statusTap(); });
 $('#btnClose').addEventListener('click', closeSettings);
 $('#settings').addEventListener('click', (e) => { if (e.target.id === 'settings') closeSettings(); });
 $('#camSelect').addEventListener('change', async (e) => { await startCamera(e.target.value); startSearch(); });
@@ -934,6 +1336,7 @@ $('#btnRedetect').addEventListener('click', () => { closeSettings(); S.best = nu
 window.addEventListener('pagehide', () => S.stream?.getTracks().forEach((t) => t.stop()));
 
 renderSuggestion();
+updateLearnInfo();
 startEngine();
 waitForCv().then(({ cv }) => { S.cv = cv; });
 requestAnimationFrame(loop);

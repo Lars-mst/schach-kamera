@@ -16,8 +16,17 @@ und zeigt den besten nächsten Zug (Stockfish) als Overlay direkt auf dem Brett.
    immer in eine Dame.
 4. **Vorschlag**: Stockfish 17.1 (lite, single-threaded WASM) rechnet im Web Worker.
 
-Figuren werden noch nicht einzeln per KI erkannt: Die App startet aus der Grundstellung
-(oder einer FEN-Stellung) und leitet jede Figur aus den Zügen ab.
+5. **Abgleich mit dem Bild**: Aus jeder bestätigten Stellung lernt die App, wie leere Felder,
+   weiße und schwarze Figuren bei deinem Licht aussehen (Farbmodell je Feldfarbe), und speichert
+   kleine Bildvorlagen jeder Figurenart (im Browser, `localStorage`). Passt das Bild nicht mehr zur
+   Stellung, sucht sie die Zugfolge (bis zu 3 Halbzüge, auch mit Korrektur des letzten Zuges), die
+   das Bild erklärt. Findet sie keine, gibt es keinen Vorschlag, sondern einen Hinweis zum Neu-Einlesen.
+6. **Stellung scannen**: Mit gelerntem Figurenset liest die App eine Stellung mitten in der Partie
+   ein (Farben aus dem Farbmodell, Figurenart aus den Vorlagen plus Regeln wie Figurenanzahl,
+   Läuferfarben und Bauernlinien). Die erkannte Stellung wird zur Bestätigung angezeigt und lässt
+   sich per Antippen korrigieren.
+7. **Nachführen**: Bewegt sich die Kamera, wird der Brettumriss laufend neu gesucht, die
+   Ausrichtung bleibt erhalten. Jede Figur bekommt einen perspektivischen Ring auf ihrem Feld.
 
 ## Lokal starten
 

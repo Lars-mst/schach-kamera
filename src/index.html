@@ -14,7 +14,7 @@
   <canvas id="overlay"></canvas>
 
   <header id="topbar">
-    <div id="status" class="pill" data-tone="idle" hidden><span class="dot"></span><span id="statusText"></span></div>
+    <div id="status" class="pill" data-tone="idle" role="button" tabindex="0" hidden><span class="dot"></span><span id="statusText"></span></div>
     <div class="top-actions">
       <button id="btnUndo" class="icon-btn" aria-label="Letzten Zug zurücknehmen" hidden>↶</button>
       <button id="btnSettings" class="icon-btn" aria-label="Einstellungen">⚙︎</button>
@@ -30,8 +30,8 @@
     <h1>Schach Kamera</h1>
     <p class="lead">Richte die Kamera auf ein Schachbrett. Die App erkennt das Brett, verfolgt jeden Zug und zeigt dir direkt auf dem Brett, welche Figur wohin ziehen sollte.</p>
     <ul class="prereq">
-      <li><b>Grundstellung</b> aufbauen, bevor du startest.</li>
-      <li><b>Kamera fest</b> hinstellen (Halter, Stativ, Bücherstapel). Sie darf sich während der Partie nicht bewegen.</li>
+      <li><b>Beim ersten Mal die Grundstellung</b> aufbauen: Die App lernt dabei dein Figurenset. Danach kann sie auch jede Stellung mitten in der Partie einlesen.</li>
+      <li><b>Kamera möglichst ruhig</b> halten oder hinstellen. Verrutscht sie, führt die App das Brett nach.</li>
       <li><b>Ganzes Brett</b> im Bild, am besten möglichst von oben.</li>
       <li><b>Gleichmäßiges Licht</b> ohne harte Schatten.</li>
     </ul>
@@ -55,6 +55,11 @@
         <button id="btnRedetect">Brett neu suchen</button>
         <button id="btnManual">Ecken antippen</button>
       </div>
+      <div class="row">
+        <button id="btnScan">Stellung scannen</button>
+        <button id="btnForget">Gelerntes Figurenset löschen</button>
+      </div>
+      <p class="fine" id="learnInfo"></p>
       <label class="field">Kamera <select id="camSelect"></select></label>
       <label class="field">Ich spiele
         <select id="colorSelect">
@@ -79,6 +84,26 @@
         <button id="btnClose" class="primary">Fertig</button>
       </div>
       <p class="fine">Wird ein Zug nicht erkannt, tippe im Bild erst auf das Startfeld und dann auf das Zielfeld.</p>
+    </div>
+  </section>
+
+  <section id="scan" hidden>
+    <div class="sheet">
+      <h2>Erkannte Stellung</h2>
+      <p class="fine">Stimmt das so? Danach verfolgt die App die Partie ab hier.</p>
+      <div id="scanBoard" class="miniboard"></div>
+      <label class="field">Am Zug
+        <select id="scanTurn">
+          <option value="w">Weiß</option>
+          <option value="b">Schwarz</option>
+        </select>
+      </label>
+      <p class="fine" id="scanMsg"></p>
+      <div class="row">
+        <button id="btnScanRetry">Nochmal scannen</button>
+        <button id="btnScanCancel">Abbrechen</button>
+        <button id="btnScanOk" class="primary">Übernehmen</button>
+      </div>
     </div>
   </section>
 
