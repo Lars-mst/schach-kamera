@@ -28,6 +28,8 @@ const S = {
   Hinv: null,
   game: new Chess(),
   myColor: 'w',
+  colorAuto: true,       // eigene Farbe aus der Lage des Bretts ableiten
+  colorDecided: false,
   thinkMs: 500,
   ref: null,             // Feld-Merkmale der zuletzt bestätigten Stellung
   prev: null,
@@ -118,10 +120,36 @@ const BOARD_CORNERS = [[0, 0], [0, 8], [8, 8], [8, 0]];
 const cornersFrom = (quad, a1) => [0, 1, 2, 3].map((i) => quad[(a1 + i) % 4]);
 
 function setBoard(quad, a1) {
+  const turned = a1 !== S.a1 || !S.colorDecided;
   S.quad = quad;
   S.a1 = a1;
   S.H = homography(BOARD_CORNERS, cornersFrom(quad, a1));
   S.Hinv = homography(cornersFrom(quad, a1), BOARD_CORNERS);
+  // Farbe nur beim ersten Finden oder nach dem Drehen festlegen, nicht bei jedem Nachführen
+  if (S.colorAuto && turned) {
+    const c = nearColor() || 'both';
+    S.colorDecided = true;
+    if (c !== S.myColor) {
+      S.myColor = c;
+      if (S.mode === 'track') requestSuggestion();
+    }
+  }
+}
+
+// Wer spielt hier? Die Seite, die näher an der Kamera ist: Dort erscheinen die Felder größer
+// und weiter unten im Bild. Bei Blick genau von oben entscheidet die Lage im Bild.
+function nearColor() {
+  const row = (v) => {
+    const pts = [0, 8].flatMap((u) => [project(S.H, u, v), project(S.H, u, v + 1)]);
+    const [a, b, c, d] = [pts[0], pts[2], pts[3], pts[1]];
+    const area = Math.abs((a[0] * b[1] - b[0] * a[1]) + (b[0] * c[1] - c[0] * b[1]) + (c[0] * d[1] - d[0] * c[1]) + (d[0] * a[1] - a[0] * d[1])) / 2;
+    return { area, y: (a[1] + b[1] + c[1] + d[1]) / 4 };
+  };
+  const w = row(0), b = row(7);
+  const h = work.height || 1;
+  const score = Math.log(w.area / b.area) * 2 + (w.y - b.y) / h;
+  if (Math.abs(score) < 0.12) return null; // Brett steht quer: nicht raten, dann Tipps für beide Seiten
+  return score > 0 ? 'w' : 'b';
 }
 
 // Für jede der 4 möglichen Ausrichtungen: welches Feld der aktuellen Beschriftung entspricht Feld s?
@@ -451,10 +479,9 @@ function matchMove(d, stats) {
   if (changed.length > 24) return { kind: 'camera' };
   const { occ, reliable } = occupancy(stats, S.game);
   let best = null, second = null;
-  for (const m of S.game.moves({ verbose: true })) {
-    if (m.promotion && m.promotion !== 'q') continue;
+  const scoreOf = (m) => {
     const inv = involvedSquares(m);
-    if (d[inv[0][0]] < thr * 0.4 || d[inv[1][0]] < thr * 0.3) continue;
+    if (d[inv[0][0]] < thr * 0.4 || d[inv[1][0]] < thr * 0.3) return null;
     let score = 0;
     const near = new Set();
     for (const [sq, after] of inv) {
@@ -468,6 +495,14 @@ function matchMove(d, stats) {
       if (inv.some(([sq]) => sq === c)) continue;
       score -= (near.has(c) ? 0.15 : 0.6) * Math.min(4, d[c] / thr);
     }
+    return { score, inv };
+  };
+  for (const m of S.game.moves({ verbose: true })) {
+    if (m.promotion && m.promotion !== 'q') continue;
+    const r = scoreOf(m);
+    if (!r) continue;
+    let { score } = r;
+    const inv = r.inv;
     // Den vorgeschlagenen (oder von Stockfish erwarteten) Zug bevorzugen: wird er gespielt,
     // reicht schon eine schwächere Veränderung.
     if (S.expect && m.from + m.to === S.expect.slice(0, 4)) score += 0.5;
@@ -482,10 +517,59 @@ function matchMove(d, stats) {
   }
   const margin = best && second ? best.score - second.score : 9;
   if (best && best.score >= 0.6 && margin >= 0.35) return { kind: 'move', move: best.m, score: best.score, margin, reliable };
+  // Rückfallebene Gangart: Stammt die Stellung aus einem Scan, kann eine Figurenart falsch sein.
+  // Passt die Bewegung (woher, wohin, welche Richtung) zu keiner Figur, wie wir sie kennen,
+  // prüfen wir, welche Figurenart genau so ziehen könnte, und korrigieren sie.
+  if (S.fromScan && changed.length) {
+    const alt = retypeMove(scoreOf, d, thr);
+    if (alt && alt.score >= 0.8 && (!best || alt.score > best.score + 0.5)) return { kind: 'move', move: alt.m, retype: alt.retype, score: alt.score, margin: 9, reliable };
+  }
   // Nur schwache Veränderung ohne passenden Zug: abwarten, aber Referenz behalten,
   // damit ein langsam sichtbar werdender Zug nicht verloren geht.
   if (!changed.length) return { kind: 'weak' };
   return { kind: 'unclear', changed, score: best?.score, margin };
+}
+
+const RETYPE_ORDER = ['n', 'b', 'r', 'q', 'p'];
+
+function retypeMove(scoreOf, d, thr) {
+  const turn = S.game.turn();
+  const board = S.game.board();
+  let best = null;
+  for (let sq = 0; sq < 64; sq++) {
+    if (d[sq] < thr * 0.4) continue;
+    const p = board[7 - (sq >> 3)][sq % 8];
+    if (!p || p.color !== turn || p.type === 'k') continue;
+    const name = FILES[sq % 8] + ((sq >> 3) + 1);
+    for (const type of RETYPE_ORDER) {
+      if (type === p.type) continue;
+      if (type === 'p' && (sq >> 3) % 7 === 0) continue;
+      const g = new Chess(S.game.fen());
+      g.remove(name);
+      if (!g.put({ type, color: turn }, name)) continue;
+      let moves;
+      try { moves = g.moves({ square: name, verbose: true }); } catch { continue; }
+      for (const m of moves) {
+        if (m.promotion && m.promotion !== 'q') continue;
+        const r = scoreOf(m);
+        if (!r) continue;
+        // Umdeuten kostet etwas; bei Gleichstand gewinnt die Figurenart, die besser zum Bild passt
+        const score = r.score - 0.7 + typeFit(turn, type, m.to) * 0.5;
+        if (!best || score > best.score) best = { m, score, retype: { square: name, type, was: p.type } };
+      }
+    }
+  }
+  return best;
+}
+
+// Wie gut passt das Bild auf dem Zielfeld zur Figurenart (0..1, ohne gelerntes Set 0,5)?
+function typeFit(color, type, square) {
+  if (!S.templates.ready || !S.lastImg || !S.H) return 0.5;
+  const sq = sqIndex(square);
+  const sims = S.templates.similarities(color, cropPatch(S.lastImg, (u, v) => project(S.H, u, v), sq), isDark(sq));
+  const vals = Object.values(sims);
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  return hi > lo ? (sims[type] - lo) / (hi - lo) : 0.5;
 }
 
 const permute = (arr, perm, width) => {
@@ -498,6 +582,20 @@ function detectMove(cur, ref) {
   const d = squareDiffs(cur, ref);
   const stats = squareStats(cur);
   const res = matchMove(d, stats);
+  // Frisch eingelesene Stellung: Wer am Zug ist, war nur geraten. Passt kein Zug, mit der anderen Seite probieren.
+  if (res.kind === 'unclear' && S.fromScan && !S.game.history().length) {
+    const keep = S.game;
+    const parts = keep.fen().split(' ');
+    parts[1] = parts[1] === 'w' ? 'b' : 'w'; parts[3] = '-';
+    let flipped = null;
+    try { flipped = new Chess(parts.join(' ')); } catch { /* andere Seite im Schach: unmöglich */ }
+    if (flipped) {
+      S.game = flipped;
+      const r = matchMove(d, stats);
+      S.game = keep;
+      if (r.kind === 'move') return { ...r, flipTurn: flipped };
+    }
+  }
   // Nach den ersten Zügen steht die Ausrichtung fest; dann nie mehr umdrehen
   if (res.kind !== 'unclear' || S.game.history().length >= 6) return res;
   // Passt kein Zug, war vielleicht die Ausrichtung falsch geschätzt: die anderen 3 Drehungen prüfen.
@@ -547,6 +645,7 @@ function trackStep(img) {
   S.evaluated = true;
   if (!S.ref) { S.ref = cur; if (!verifyPosition(img, cur) && !S.inconsistent) idleStatus(); return; }
 
+  S.lastImg = img;
   const res = detectMove(cur, S.ref);
   if (DEBUG) console.log('detect', res.kind, res.move?.san || '', res.score?.toFixed(2) || '', res.margin?.toFixed(2) || '', res.orientation ?? '');
   if (res.kind === 'none') { S.ref = cur; if (!verifyPosition(img, cur) && !S.unclear && !S.inconsistent) idleStatus(); return; }
@@ -570,6 +669,15 @@ function trackStep(img) {
     setBoard(S.quad, res.orientation);
     applyMove(res.move, features(img));
     return;
+  }
+  if (res.flipTurn) S.game = res.flipTurn;
+  if (res.retype) {
+    const { square, type, was } = res.retype;
+    const g = new Chess(S.game.fen());
+    g.remove(square);
+    g.put({ type, color: g.turn() }, square);
+    S.game = g;
+    S.notice = { text: `Figur korrigiert: ${PIECE_DE[type]} statt ${PIECE_DE[was]}`, until: performance.now() + 5000 };
   }
   applyMove(res.move, cur);
 }
@@ -1347,8 +1455,6 @@ overlay.addEventListener('pointerup', () => { S.drag = -1; });
 const closeSettings = () => { $('#settings').hidden = true; };
 
 $('#btnStart').addEventListener('click', async () => {
-  S.myColor = $('#introColor').value;
-  $('#colorSelect').value = S.myColor;
   $('#introMsg').textContent = 'Kamera wird gestartet …';
   try {
     await startCamera();
@@ -1380,7 +1486,12 @@ $('#status').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key
 $('#btnClose').addEventListener('click', closeSettings);
 $('#settings').addEventListener('click', (e) => { if (e.target.id === 'settings') closeSettings(); });
 $('#camSelect').addEventListener('change', async (e) => { await startCamera(e.target.value); startSearch(); });
-$('#colorSelect').addEventListener('change', (e) => { S.myColor = e.target.value; requestSuggestion(); });
+$('#colorSelect').addEventListener('change', (e) => {
+  S.colorAuto = e.target.value === 'auto';
+  if (S.colorAuto) S.myColor = (S.H && nearColor()) || S.myColor;
+  else S.myColor = e.target.value;
+  requestSuggestion();
+});
 $('#thinkSelect').addEventListener('change', (e) => { S.thinkMs = Number(e.target.value); });
 $('#btnFen').addEventListener('click', () => {
   try {
@@ -1427,7 +1538,7 @@ $('#btnAdjust').addEventListener('click', () => {
 $('#btnStop').addEventListener('click', () => {
   S.stream?.getTracks().forEach((t) => t.stop());
   S.stream = null; video.srcObject = null;
-  S.mode = 'idle'; S.fresh = true; S.best = null; S.correctUntil = 0;
+  S.mode = 'idle'; S.fresh = true; S.best = null; S.correctUntil = 0; S.colorDecided = false;
   engine.worker?.postMessage('stop');
   $('#panel').hidden = true; $('#bottombar').hidden = true; $('#status').hidden = true;
   $('#introMsg').textContent = '';
@@ -1443,4 +1554,5 @@ startEngine();
 waitForCv().then(({ cv }) => { S.cv = cv; });
 requestAnimationFrame(loop);
 requestAnimationFrame(draw);
-if (DEBUG) window.__dbg = { findQuads, refineGrid, grab, guessOrientation };
+if (DEBUG) window.__dbg = { findQuads, refineGrid, grab, guessOrientation,
+  ll: () => { const f = features(grab()); const ll = S.model.logLik(colorFeatures(f, PER)); const cf = colorFeatures(f, PER); return Array.from({ length: 64 }, (_, q) => FILES[q % 8] + ((q >> 3) + 1) + ' ' + [0, 1, 2].map((k) => ll[q * 3 + k].toFixed(1)).join('/') + ' f=' + Array.from(cf.slice(q * 5, q * 5 + 5)).map((x) => x.toFixed(2)).join(',')); } };

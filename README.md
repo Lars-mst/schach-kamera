@@ -9,7 +9,10 @@ und zeigt den besten nächsten Zug (Stockfish) als Overlay direkt auf dem Brett.
    so eingepasst, dass die mittleren Felder das klarste Schachmuster zeigen (ein Rand mit
    Koordinaten wird dadurch ignoriert).
 2. **Ausrichtung**: a1 ist ein dunkles Eckfeld, Weiß steht auf der Seite mit den helleren Figuren.
-   Falls das nicht passt: „Brett drehen“.
+   Falls das nicht passt: „Brett drehen“. Die eigene Farbe ist die Seite, die näher an der Kamera
+   liegt (größere Felder, weiter unten im Bild); steht das Brett quer, gibt es Tipps für beide Seiten.
+   Stammt die Stellung aus einem Scan, korrigiert die Zugerkennung Figurenarten anhand der Gangart
+   (z. B. ein „Bauer“, der schräg über drei Felder zieht, ist ein Läufer).
 3. **Züge erkennen**: Jedes Feld wird mit dem letzten ruhigen Bild verglichen. Sobald sich nichts
    mehr bewegt (Hand weg), wird unter allen legalen Zügen (chess.js) derjenige gewählt, der zu
    den veränderten Feldern passt. Rochade und en passant werden berücksichtigt, Umwandlung

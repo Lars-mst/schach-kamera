@@ -36,16 +36,10 @@
     <ul class="prereq">
       <li><b>Beim ersten Mal die Grundstellung</b> aufbauen: Die App lernt dabei dein Figurenset. Danach kann sie auch jede Stellung mitten in der Partie einlesen.</li>
       <li><b>Kamera möglichst ruhig</b> halten oder hinstellen. Verrutscht sie, führt die App das Brett nach.</li>
+      <li><b>Von deiner Seite aus filmen:</b> Die App erkennt deine Farbe daran, welche Seite näher an der Kamera ist, und gibt dir sofort Tipps.</li>
       <li><b>Ganzes Brett</b> im Bild, am besten möglichst von oben.</li>
       <li><b>Gleichmäßiges Licht</b> ohne harte Schatten.</li>
     </ul>
-    <label class="field">Ich spiele
-      <select id="introColor">
-        <option value="w">Weiß</option>
-        <option value="b">Schwarz</option>
-        <option value="both">Beide Seiten (Analyse)</option>
-      </select>
-    </label>
     <button id="btnStart" class="primary">Kamera starten</button>
     <p class="fine" id="introMsg"></p>
   </section>
@@ -67,6 +61,7 @@
       <label class="field">Kamera <select id="camSelect"></select></label>
       <label class="field">Ich spiele
         <select id="colorSelect">
+          <option value="auto" selected>Automatisch (Seite näher an der Kamera)</option>
           <option value="w">Weiß</option>
           <option value="b">Schwarz</option>
           <option value="both">Beide Seiten (Analyse)</option>
