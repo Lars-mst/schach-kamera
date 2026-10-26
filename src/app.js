@@ -743,7 +743,7 @@ $('#btnStart').addEventListener('click', async () => {
   } catch (e) {
     $('#introMsg').textContent = window.isSecureContext
       ? 'Kein Kamerazugriff. Erlaube die Kamera in den Browser-Einstellungen und lade die Seite neu.'
-      : 'Die Kamera funktioniert nur über https:// – öffne die App über den Vercel-Link.';
+      : 'Die Kamera funktioniert nur über https:// – öffne die App über lars-mst.github.io/schach-kamera.';
     return;
   }
   $('#intro').hidden = true;

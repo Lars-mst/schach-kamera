@@ -27,7 +27,8 @@ npm run build
 npm run serve   # http://localhost:8080
 ```
 
-Auf dem iPhone braucht die Kamera HTTPS, daher dort den Vercel-Link nutzen.
+Auf dem iPhone braucht die Kamera HTTPS, daher dort https://lars-mst.github.io/schach-kamera/ nutzen.
+Jeder Push auf `main` baut die App neu und veröffentlicht sie über den Zweig `gh-pages`.
 Mit `?debug=1` wird oben links die entzerrte Brettansicht eingeblendet.
 
 ## Lizenzen
