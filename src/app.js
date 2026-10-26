@@ -55,6 +55,7 @@ const S = {
   inconsistent: false,
   notice: null,          // { text, until }
   scan: null,            // offene Scan-Bestätigung
+  flash: null,           // { squares, at }: gerade erkannter Zug
   pv: [],                // Hauptvariante von Stockfish zur aktuellen Stellung
   expect: null,          // erwarteter nächster Zug (uci): Vorschlag oder vorhergesagte Antwort
   fromScan: false,       // Stellung stammt aus einem Scan: Figurenarten noch nicht sicher
@@ -556,6 +557,9 @@ function trackStep(img) {
     return;
   }
   if (res.kind === 'unclear') {
+    // Oft ist nur die Hand noch über dem Brett: kurz weiter beobachten, bevor wir nachhaken.
+    // Ein sauberer Zug wird so weiterhin sofort erkannt.
+    if (S.stable < 6) { S.evaluated = false; return; }
     if (verifyPosition(img, cur, true)) return;
     S.unclear = true;
     if (!S.inconsistent) setStatus('Zug nicht erkannt – tippe Start- und Zielfeld an', 'warn');
@@ -577,6 +581,7 @@ function applyMove(m, cur) {
   const pv = S.pv;
   S.expect = pv[0] && pv[0].slice(0, 4) === played.from + played.to ? pv[1] || null : null;
   S.lastMove = played;
+  S.flash = { squares: [played.from, played.to], at: performance.now() };
   afterPositionChange(cur);
 }
 
@@ -648,6 +653,7 @@ function verifyPosition(img, cur, urgent = false) {
     for (const m of fix.seq) S.game.move({ from: m.from, to: m.to, promotion: 'q' });
     const h = S.game.history({ verbose: true });
     S.lastMove = h[h.length - 1] || null;
+    S.flash = { squares: fix.seq.flatMap((m) => [m.from, m.to]), at: performance.now() };
     S.notice = { text: `Erkannt: ${fix.seq.map((m) => m.san).join(', ') || 'letzter Zug zurückgenommen'}`, until: performance.now() + 5000 };
     afterPositionChange(cur);
     return true;
@@ -975,7 +981,7 @@ function idleStatus() {
 function moveText(b) {
   if (b.san.startsWith('O-O-O')) return 'Lange Rochade';
   if (b.san.startsWith('O-O')) return 'Kurze Rochade';
-  let t = `${PIECE_DE[b.piece]} ${b.from} → ${b.to}`;
+  let t = `${GLYPH[b.piece]} ${PIECE_DE[b.piece]} ${b.from} → ${b.to}`;
   if (b.san.includes('x')) t += ' (schlägt)';
   if (b.promotion) t += ', wird Dame';
   return t;
@@ -999,7 +1005,7 @@ function renderSuggestion(placeholder) {
     panel.dataset.tone = 'wait';
     if (placeholder) S.placeholder = placeholder;
     move.textContent = S.placeholder || '–';
-    meta.textContent = notice || (S.lastMove ? `Letzter Zug: ${S.lastMove.san}` : '');
+    meta.textContent = notice || (S.lastMove ? `Zuletzt: ${GLYPH[S.lastMove.piece]} ${S.lastMove.from} → ${S.lastMove.to}` : '');
   }
 }
 
@@ -1054,15 +1060,9 @@ function draw(t) {
   }
 
   if ((S.mode === 'track' || S.mode === 'adjust') && S.H) {
-    // Brett umranden: dezente leuchtende Kontur
-    const outline = BOARD_CORNERS.map(([u, v]) => boardToScreen(u, v, vm));
-    octx.save();
-    octx.shadowColor = cBoard; octx.shadowBlur = 14;
-    octx.lineWidth = 2.5; octx.strokeStyle = cBoard; octx.globalAlpha = 0.7;
-    polyPath(outline); octx.stroke();
-    octx.restore();
-
-    drawPieces(vm);
+    drawFrame(vm, cBoard);
+    drawPieces(vm, S.best && !S.inconsistent ? S.best.from : null);
+    drawFlash(t, vm, css.getPropertyValue('--ok').trim());
     if (S.mismatch.length && S.badStreak >= 2) {
       octx.save();
       octx.fillStyle = css.getPropertyValue('--warn').trim();
@@ -1103,54 +1103,95 @@ function draw(t) {
 // mit der Brettebene verzerrt), damit man sieht, was die App wo vermutet.
 const RING = Array.from({ length: 28 }, (_, i) => [Math.cos((i / 28) * Math.PI * 2), Math.sin((i / 28) * Math.PI * 2)]);
 // Dazu ein kleines Symbol der Figurenart am vorderen Rand des Rings (die Figur selbst
-// verdeckt die Feldmitte).
-function drawPieces(vm) {
+// verdeckt die Feldmitte). Gibt es einen Vorschlag, treten die übrigen Figuren zurück.
+function drawPieces(vm, focus) {
   const board = S.game.board();
   const badges = [];
+  const cMove = getComputedStyle(document.documentElement).getPropertyValue('--move').trim();
   octx.save();
   for (let r = 0; r < 8; r++) for (let f = 0; f < 8; f++) {
     const p = board[7 - r][f];
     if (!p) continue;
-    const pts = RING.map(([c, s]) => boardToScreen(f + 0.5 + c * 0.36, r + 0.5 + s * 0.36, vm));
+    const name = FILES[f] + (r + 1);
+    const hot = name === focus;
+    const pts = RING.map(([c, s]) => boardToScreen(f + 0.5 + c * 0.34, r + 0.5 + s * 0.34, vm));
+    octx.globalAlpha = hot ? 1 : focus ? 0.45 : 0.75;
     polyPath(pts);
-    if (p.color === 'w') {
-      octx.strokeStyle = 'rgba(255,255,255,0.8)'; octx.lineWidth = 2; octx.stroke();
-    } else {
-      octx.strokeStyle = 'rgba(255,255,255,0.35)'; octx.lineWidth = 4; octx.stroke();
-      octx.strokeStyle = 'rgba(20,24,30,0.9)'; octx.lineWidth = 2; octx.stroke();
-    }
+    octx.lineWidth = hot ? 2.5 : 1.5;
+    octx.strokeStyle = hot ? cMove : p.color === 'w' ? 'rgba(255,255,255,0.85)' : 'rgba(15,18,22,0.85)';
+    if (hot) { octx.shadowColor = cMove; octx.shadowBlur = 10; }
+    octx.stroke();
+    octx.shadowBlur = 0;
     const front = pts.reduce((a, b) => (b[1] > a[1] ? b : a));
     const xs = pts.map((q) => q[0]);
-    badges.push({ p, x: front[0], y: front[1], size: Math.max(...xs) - Math.min(...xs) });
+    badges.push({ p, hot, x: front[0], y: front[1], size: Math.max(...xs) - Math.min(...xs) });
   }
   // Symbole nach den Ringen zeichnen, von hinten nach vorne
   badges.sort((a, b) => a.y - b.y);
   octx.textAlign = 'center'; octx.textBaseline = 'middle';
-  for (const { p, x, y, size } of badges) {
-    const rad = Math.max(8, Math.min(15, size * 0.22));
+  for (const { p, hot, x, y, size } of badges) {
+    const rad = Math.max(7, Math.min(13, size * 0.19));
+    octx.globalAlpha = hot ? 1 : focus ? 0.5 : 0.85;
     octx.beginPath(); octx.arc(x, y, rad, 0, Math.PI * 2);
-    octx.fillStyle = p.color === 'w' ? 'rgba(250,250,247,0.95)' : 'rgba(22,26,32,0.95)';
+    octx.fillStyle = hot ? cMove : p.color === 'w' ? 'rgba(250,250,247,0.92)' : 'rgba(18,21,26,0.88)';
     octx.fill();
-    octx.lineWidth = 1; octx.strokeStyle = p.color === 'w' ? 'rgba(0,0,0,0.35)' : 'rgba(255,255,255,0.45)'; octx.stroke();
-    octx.fillStyle = p.color === 'w' ? '#1a1d22' : '#f4f4f0';
-    octx.font = `${Math.round(rad * 1.45)}px -apple-system, "Segoe UI Symbol", sans-serif`;
+    octx.fillStyle = hot || p.color === 'w' ? '#15181d' : '#f4f4f0';
+    octx.font = `${Math.round(rad * 1.4)}px -apple-system, "Segoe UI Symbol", sans-serif`;
     octx.fillText(GLYPH[p.type], x, y + rad * 0.08);
   }
   octx.restore();
 }
 
+// Brett nur mit leuchtenden Eckwinkeln markieren, dazu eine kaum sichtbare Kontur
+function drawFrame(vm, color) {
+  const c = BOARD_CORNERS.map(([u, v]) => boardToScreen(u, v, vm));
+  octx.save();
+  octx.strokeStyle = color; octx.lineCap = 'round';
+  octx.globalAlpha = 0.18; octx.lineWidth = 1;
+  polyPath(c); octx.stroke();
+  octx.globalAlpha = 0.9; octx.lineWidth = 3;
+  octx.shadowColor = color; octx.shadowBlur = 10;
+  octx.beginPath();
+  for (let i = 0; i < 4; i++) {
+    const p = c[i], a = c[(i + 3) % 4], b = c[(i + 1) % 4];
+    octx.moveTo(p[0] + (a[0] - p[0]) * 0.1, p[1] + (a[1] - p[1]) * 0.1);
+    octx.lineTo(p[0], p[1]);
+    octx.lineTo(p[0] + (b[0] - p[0]) * 0.1, p[1] + (b[1] - p[1]) * 0.1);
+  }
+  octx.stroke();
+  octx.restore();
+}
+
+// Erkannter Zug leuchtet kurz grün auf: sichtbare Bestätigung, dass die App ihn hat
+function drawFlash(t, vm, color) {
+  const f = S.flash;
+  if (!f) return;
+  const age = (performance.now() - f.at) / 900;
+  if (age >= 1) { S.flash = null; return; }
+  octx.save();
+  octx.fillStyle = color; octx.strokeStyle = color; octx.lineWidth = 2.5;
+  octx.shadowColor = color; octx.shadowBlur = 16;
+  for (const sq of f.squares) {
+    const poly = squarePoly(sq, vm, 0.05);
+    octx.globalAlpha = 0.45 * (1 - age); polyPath(poly); octx.fill();
+    octx.globalAlpha = 1 - age; polyPath(poly); octx.stroke();
+  }
+  octx.restore();
+}
+
+// Vorschlag: Startfeld dezent, Zielfeld pulsiert, schlanker leuchtender Pfeil in der Brettebene.
 function drawBest(t, vm, color) {
   const b = S.best;
-  const pulse = 0.5 + 0.5 * Math.sin(t / 260);
+  const pulse = 0.5 + 0.5 * Math.sin(t / 300);
   octx.save();
-  octx.fillStyle = color;
-  octx.globalAlpha = 0.3; polyPath(squarePoly(b.from, vm, 0.04)); octx.fill();
-  octx.globalAlpha = 0.35 + 0.3 * pulse; polyPath(squarePoly(b.to, vm, 0.04)); octx.fill();
-  octx.globalAlpha = 1; octx.lineWidth = 2; octx.strokeStyle = color;
-  polyPath(squarePoly(b.from, vm, 0.04)); octx.stroke();
-  polyPath(squarePoly(b.to, vm, 0.04)); octx.stroke();
+  octx.fillStyle = color; octx.strokeStyle = color;
+  octx.globalAlpha = 0.16; polyPath(squarePoly(b.from, vm, 0.06)); octx.fill();
+  octx.globalAlpha = 0.2 + 0.25 * pulse; polyPath(squarePoly(b.to, vm, 0.06)); octx.fill();
+  octx.shadowColor = color; octx.shadowBlur = 8 + 10 * pulse;
+  octx.globalAlpha = 0.95; octx.lineWidth = 2.5;
+  polyPath(squarePoly(b.to, vm, 0.06)); octx.stroke();
 
-  // Pfeil liegt in der Brettebene; Springer laufen über die L-Form.
+  // Springer laufen über die L-Form
   const f = [FILES.indexOf(b.from[0]) + 0.5, Number(b.from[1]) - 0.5];
   const to = [FILES.indexOf(b.to[0]) + 0.5, Number(b.to[1]) - 0.5];
   let path = [f, to];
@@ -1160,50 +1201,26 @@ function drawBest(t, vm, color) {
   }
   const pts = path.map(([u, v]) => boardToScreen(u, v, vm));
   const sqPx = Math.hypot(...[0, 1].map((k) => boardToScreen(to[0] + 0.5, to[1], vm)[k] - boardToScreen(to[0] - 0.5, to[1], vm)[k]));
-  const w = Math.max(5, sqPx * 0.16);
+  const w = Math.max(4, sqPx * 0.1);
   const [px, py] = pts[pts.length - 2], [ex, ey] = pts[pts.length - 1];
   const ang = Math.atan2(ey - py, ex - px);
-  const head = w * 2.4;
-  const tip = [ex, ey], base = [ex - Math.cos(ang) * head, ey - Math.sin(ang) * head];
-  octx.shadowColor = 'rgba(0,0,0,.55)'; octx.shadowBlur = 8;
-  octx.strokeStyle = color; octx.lineWidth = w; octx.lineCap = 'round'; octx.lineJoin = 'round';
+  const head = w * 2.6;
+  const base = [ex - Math.cos(ang) * head, ey - Math.sin(ang) * head];
+  const [sx, sy] = pts[0];
+  const grad = octx.createLinearGradient(sx, sy, ex, ey);
+  grad.addColorStop(0, 'rgba(245,196,81,0.35)'); grad.addColorStop(1, color);
+  octx.globalAlpha = 1; octx.shadowBlur = 12;
+  octx.strokeStyle = grad; octx.lineWidth = w; octx.lineCap = 'round'; octx.lineJoin = 'round';
   octx.beginPath();
   pts.slice(0, -1).forEach(([x, y], i) => (i ? octx.lineTo(x, y) : octx.moveTo(x, y)));
   octx.lineTo(base[0], base[1]);
   octx.stroke();
   octx.fillStyle = color;
   octx.beginPath();
-  octx.moveTo(tip[0], tip[1]);
-  octx.lineTo(base[0] + Math.cos(ang + Math.PI / 2) * w * 1.3, base[1] + Math.sin(ang + Math.PI / 2) * w * 1.3);
-  octx.lineTo(base[0] + Math.cos(ang - Math.PI / 2) * w * 1.3, base[1] + Math.sin(ang - Math.PI / 2) * w * 1.3);
+  octx.moveTo(ex, ey);
+  octx.lineTo(base[0] + Math.cos(ang + Math.PI / 2) * w * 1.25, base[1] + Math.sin(ang + Math.PI / 2) * w * 1.25);
+  octx.lineTo(base[0] + Math.cos(ang - Math.PI / 2) * w * 1.25, base[1] + Math.sin(ang - Math.PI / 2) * w * 1.25);
   octx.closePath(); octx.fill();
-
-  // Schwebende Markierung über dem Zielfeld (Lichtsäule + Raute mit Figur)
-  const bob = Math.sin(t / 400) * sqPx * 0.08;
-  const topY = ey - sqPx * 1.5 - bob;
-  const grad = octx.createLinearGradient(ex, ey, ex, topY);
-  grad.addColorStop(0, 'rgba(245,196,81,0.0)'); grad.addColorStop(1, 'rgba(245,196,81,0.55)');
-  octx.shadowBlur = 0;
-  octx.fillStyle = grad;
-  octx.beginPath(); octx.moveTo(ex - sqPx * 0.12, ey); octx.lineTo(ex + sqPx * 0.12, ey); octx.lineTo(ex + sqPx * 0.04, topY); octx.lineTo(ex - sqPx * 0.04, topY); octx.closePath(); octx.fill();
-  const r = Math.max(16, sqPx * 0.38);
-  octx.shadowColor = 'rgba(0,0,0,.6)'; octx.shadowBlur = 10;
-  octx.fillStyle = color;
-  octx.beginPath(); octx.moveTo(ex, topY - r); octx.lineTo(ex + r * 0.85, topY); octx.lineTo(ex, topY + r); octx.lineTo(ex - r * 0.85, topY); octx.closePath(); octx.fill();
-  octx.shadowBlur = 0;
-  octx.fillStyle = '#1b1405'; octx.font = `${Math.round(r * 0.95)}px -apple-system, "Segoe UI Symbol", sans-serif`;
-  octx.textAlign = 'center'; octx.textBaseline = 'middle';
-  octx.fillText(GLYPH[b.piece], ex, topY + r * 0.05);
-  // Feldnamen direkt über der Markierung, damit man nicht nach unten schauen muss
-  const label = `${b.from}→${b.to}`;
-  octx.font = `700 ${Math.round(Math.max(13, r * 0.55))}px -apple-system, sans-serif`;
-  const lw = octx.measureText(label).width + 12, lh = Math.max(20, r * 0.8), ly = topY - r - lh - 4;
-  octx.fillStyle = 'rgba(13,16,20,.8)';
-  octx.beginPath();
-  if (octx.roundRect) octx.roundRect(ex - lw / 2, ly, lw, lh, 6); else octx.rect(ex - lw / 2, ly, lw, lh);
-  octx.fill();
-  octx.fillStyle = color;
-  octx.fillText(label, ex, ly + lh / 2);
   octx.restore();
 }
 
@@ -1223,7 +1240,7 @@ function drawDebug(img) {
 
 function loop(t) {
   requestAnimationFrame(loop);
-  const interval = S.mode === 'search' ? 200 : 110;
+  const interval = S.mode === 'search' ? 180 : 80;
   if (t - S.lastTick < interval) return;
   S.lastTick = t;
   if (S.mode !== 'search' && S.mode !== 'track') return;
