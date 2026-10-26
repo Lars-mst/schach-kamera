@@ -1,0 +1,15 @@
+{
+  "name": "schach-kamera",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Kamera-Overlay, das ein Schachbrett erkennt, Züge verfolgt und mit Stockfish den nächsten Zug vorschlägt.",
+  "scripts": {
+    "build": "node build.mjs",
+    "serve": "npx --yes http-server dist -p 8080 -c-1"
+  },
+  "dependencies": {
+    "@techstark/opencv-js": "4.10.0-release.1",
+    "chess.js": "1.4.0",
+    "stockfish": "17.1.0"
+  }
+}
