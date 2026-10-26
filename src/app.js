@@ -482,6 +482,9 @@ function matchMove(d, stats) {
   const scoreOf = (m) => {
     const inv = involvedSquares(m);
     if (d[inv[0][0]] < thr * 0.4 || d[inv[1][0]] < thr * 0.3) return null;
+    // Logik vor Bildrauschen: Nach dem Zug muss das Startfeld leer und das Zielfeld belegt aussehen.
+    // Sonst entstünde eine Figur auf einem leeren Feld.
+    if (reliable && (occ[inv[0][0]] > 0.75 || occ[inv[1][0]] < 0.25)) return null;
     let score = 0;
     const near = new Set();
     for (const [sq, after] of inv) {
@@ -725,12 +728,22 @@ function cloneGame(game) {
 // (bis zu 3 Halbzüge, auch mit Korrektur des letzten Zuges), die das Bild am besten erklärt.
 // Gibt true zurück, wenn die Stellung dabei geändert wurde.
 function verifyPosition(img, cur, urgent = false) {
-  if (!S.model.ready) {
-    if (S.needLearn && S.game.history().length) learn(img, cur);
-    return false;
-  }
+  // Zwei unabhängige Prüfungen: das gelernte Farbmodell (leer/weiß/schwarz) und eine einfache
+  // Belegt/Leer-Messung gegen die leeren Felder. Die zweite braucht nichts Gelerntes.
+  const { occ, reliable } = occupancy(squareStats(cur), S.game);
   const feats = colorFeatures(cur, PER);
-  const ll = S.model.logLik(feats);
+  let ll;
+  if (S.model.ready) ll = S.model.logLik(feats);
+  else if (reliable) ll = new Float32Array(64 * 3);
+  else return false;
+  if (reliable) {
+    for (let sq = 0; sq < 64; sq++) {
+      const o = occ[sq];
+      ll[sq * 3] -= 9 * Math.max(0, o - 0.2);
+      ll[sq * 3 + 1] -= 9 * Math.max(0, 0.8 - o);
+      ll[sq * 3 + 2] -= 9 * Math.max(0, 0.8 - o);
+    }
+  }
   const cls = classMap(S.game);
   const mism = [];
   for (let sq = 0; sq < 64; sq++) {
@@ -741,7 +754,7 @@ function verifyPosition(img, cur, urgent = false) {
   if (!mism.length) {
     S.badStreak = 0;
     if (S.inconsistent) { S.inconsistent = false; idleStatus(); renderSuggestion(); requestSuggestion(); }
-    if (S.needLearn) learn(img, cur, feats);
+    if (S.needLearn && (S.model.ready || S.game.history().length)) learn(img, cur, feats);
     return false;
   }
   S.badStreak++;
@@ -1101,7 +1114,7 @@ function renderSuggestion(placeholder) {
     // Lieber nichts empfehlen als einen Zug aus einer falschen Stellung
     panel.dataset.tone = 'wait';
     move.textContent = 'Stellung passt nicht zum Bild';
-    meta.textContent = 'Orange Felder prüfen oder oben tippen zum Neu-Einlesen';
+    meta.textContent = 'Orange markierte Felder passen nicht – oben tippen zum Neu-Einlesen';
     return;
   }
   const notice = S.notice && S.notice.until > performance.now() ? S.notice.text : '';
@@ -1175,7 +1188,9 @@ function draw(t) {
       octx.save();
       octx.fillStyle = css.getPropertyValue('--warn').trim();
       octx.strokeStyle = octx.fillStyle; octx.lineWidth = 2;
+      const board = S.game.board();
       for (const sq of S.mismatch) {
+        if (board[7 - (sq >> 3)][sq % 8]) continue; // Figuren zeigt drawPieces gestrichelt
         const poly = squarePoly(FILES[sq % 8] + ((sq >> 3) + 1), vm, 0.06);
         octx.globalAlpha = 0.25; polyPath(poly); octx.fill();
         octx.globalAlpha = 0.9; polyPath(poly); octx.stroke();
@@ -1215,7 +1230,10 @@ const RING = Array.from({ length: 28 }, (_, i) => [Math.cos((i / 28) * Math.PI *
 function drawPieces(vm, focus) {
   const board = S.game.board();
   const badges = [];
-  const cMove = getComputedStyle(document.documentElement).getPropertyValue('--move').trim();
+  const css = getComputedStyle(document.documentElement);
+  const cMove = css.getPropertyValue('--move').trim(), cWarn = css.getPropertyValue('--warn').trim();
+  // Felder, auf denen das Bild nicht zur Stellung passt: dort nichts als sicher behaupten
+  const doubt = new Set(S.badStreak >= 1 ? S.mismatch : []);
   octx.save();
   for (let r = 0; r < 8; r++) for (let f = 0; f < 8; f++) {
     const p = board[7 - r][f];
@@ -1223,6 +1241,15 @@ function drawPieces(vm, focus) {
     const name = FILES[f] + (r + 1);
     const hot = name === focus;
     const pts = RING.map(([c, s]) => boardToScreen(f + 0.5 + c * 0.34, r + 0.5 + s * 0.34, vm));
+    if (doubt.has(f + 8 * r)) {
+      // unsicher: gestrichelt in Orange mit Fragezeichen
+      octx.globalAlpha = 0.95; polyPath(pts);
+      octx.setLineDash([4, 4]); octx.lineWidth = 2; octx.strokeStyle = cWarn; octx.stroke(); octx.setLineDash([]);
+      const front = pts.reduce((a, b) => (b[1] > a[1] ? b : a));
+      const xs = pts.map((q) => q[0]);
+      badges.push({ p, doubt: true, x: front[0], y: front[1], size: Math.max(...xs) - Math.min(...xs) });
+      continue;
+    }
     octx.globalAlpha = hot ? 1 : focus ? 0.45 : 0.75;
     polyPath(pts);
     octx.lineWidth = hot ? 2.5 : 1.5;
@@ -1237,15 +1264,15 @@ function drawPieces(vm, focus) {
   // Symbole nach den Ringen zeichnen, von hinten nach vorne
   badges.sort((a, b) => a.y - b.y);
   octx.textAlign = 'center'; octx.textBaseline = 'middle';
-  for (const { p, hot, x, y, size } of badges) {
+  for (const { p, hot, doubt: unsure, x, y, size } of badges) {
     const rad = Math.max(7, Math.min(13, size * 0.19));
-    octx.globalAlpha = hot ? 1 : focus ? 0.5 : 0.85;
+    octx.globalAlpha = hot || unsure ? 1 : focus ? 0.5 : 0.85;
     octx.beginPath(); octx.arc(x, y, rad, 0, Math.PI * 2);
-    octx.fillStyle = hot ? cMove : p.color === 'w' ? 'rgba(250,250,247,0.92)' : 'rgba(18,21,26,0.88)';
+    octx.fillStyle = unsure ? cWarn : hot ? cMove : p.color === 'w' ? 'rgba(250,250,247,0.92)' : 'rgba(18,21,26,0.88)';
     octx.fill();
-    octx.fillStyle = hot || p.color === 'w' ? '#15181d' : '#f4f4f0';
-    octx.font = `${Math.round(rad * 1.4)}px -apple-system, "Segoe UI Symbol", sans-serif`;
-    octx.fillText(GLYPH[p.type], x, y + rad * 0.08);
+    octx.fillStyle = unsure || hot || p.color === 'w' ? '#15181d' : '#f4f4f0';
+    octx.font = `${unsure ? '700 ' : ''}${Math.round(rad * 1.4)}px -apple-system, "Segoe UI Symbol", sans-serif`;
+    octx.fillText(unsure ? '?' : GLYPH[p.type], x, y + rad * 0.08);
   }
   octx.restore();
 }
@@ -1454,7 +1481,20 @@ overlay.addEventListener('pointerup', () => { S.drag = -1; });
 
 const closeSettings = () => { $('#settings').hidden = true; };
 
+// Farbwahl: automatisch (Seite näher an der Kamera) oder fest Weiß/Schwarz; wird gemerkt
+function applyColorChoice(v) {
+  S.colorAuto = v === 'auto';
+  S.colorDecided = false;
+  if (!S.colorAuto) S.myColor = v;
+  else if (S.H) { S.myColor = nearColor() || 'both'; S.colorDecided = true; }
+  $('#introColor').value = v === 'both' ? 'auto' : v;
+  $('#colorSelect').value = v;
+  try { localStorage.setItem('schachkamera.farbe', v); } catch { /* egal */ }
+}
+try { const v = localStorage.getItem('schachkamera.farbe'); if (v) applyColorChoice(v); } catch { /* egal */ }
+
 $('#btnStart').addEventListener('click', async () => {
+  applyColorChoice($('#introColor').value);
   $('#introMsg').textContent = 'Kamera wird gestartet …';
   try {
     await startCamera();
@@ -1486,12 +1526,7 @@ $('#status').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key
 $('#btnClose').addEventListener('click', closeSettings);
 $('#settings').addEventListener('click', (e) => { if (e.target.id === 'settings') closeSettings(); });
 $('#camSelect').addEventListener('change', async (e) => { await startCamera(e.target.value); startSearch(); });
-$('#colorSelect').addEventListener('change', (e) => {
-  S.colorAuto = e.target.value === 'auto';
-  if (S.colorAuto) S.myColor = (S.H && nearColor()) || S.myColor;
-  else S.myColor = e.target.value;
-  requestSuggestion();
-});
+$('#colorSelect').addEventListener('change', (e) => { applyColorChoice(e.target.value); requestSuggestion(); });
 $('#thinkSelect').addEventListener('change', (e) => { S.thinkMs = Number(e.target.value); });
 $('#btnFen').addEventListener('click', () => {
   try {
