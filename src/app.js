@@ -15,7 +15,8 @@ const work = document.createElement('canvas');
 const wctx = work.getContext('2d', { willReadFrequently: true });
 
 const PIECE_DE = { p: 'Bauer', n: 'Springer', b: 'Läufer', r: 'Turm', q: 'Dame', k: 'König' };
-const GLYPH = { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚' };
+// \uFE0E erzwingt die Textdarstellung (iOS zeigt den Bauern sonst als Emoji)
+const GLYPH = { p: '♟\uFE0E', n: '♞\uFE0E', b: '♝\uFE0E', r: '♜\uFE0E', q: '♛\uFE0E', k: '♚\uFE0E' };
 const FILES = 'abcdefgh';
 
 const S = {
@@ -27,7 +28,7 @@ const S = {
   Hinv: null,
   game: new Chess(),
   myColor: 'w',
-  thinkMs: 800,
+  thinkMs: 500,
   ref: null,             // Feld-Merkmale der zuletzt bestätigten Stellung
   prev: null,
   stable: 0,
@@ -54,6 +55,11 @@ const S = {
   inconsistent: false,
   notice: null,          // { text, until }
   scan: null,            // offene Scan-Bestätigung
+  pv: [],                // Hauptvariante von Stockfish zur aktuellen Stellung
+  expect: null,          // erwarteter nächster Zug (uci): Vorschlag oder vorhergesagte Antwort
+  fromScan: false,       // Stellung stammt aus einem Scan: Figurenarten noch nicht sicher
+  correctUntil: 0,       // bis dahin bietet die Statuszeile das Korrigieren an
+  lastScan: null,
   searchKey: null,       // zuletzt erfolglos durchsuchte Abweichung
 };
 {
@@ -287,7 +293,7 @@ function onBoardLocked(img, found) {
       setBoard(S.quad, scan.o);
       enterTrack();
       if (toFen(scan.pieces, 'w').split(' ')[0] === new Chess().fen().split(' ')[0]) { S.game = new Chess(); S.needLearn = true; requestSuggestion(); }
-      else openScanDialog(scan);
+      else if (!applyScan(scan)) openScanDialog(scan);
       return;
     }
   }
@@ -461,6 +467,9 @@ function matchMove(d, stats) {
       if (inv.some(([sq]) => sq === c)) continue;
       score -= (near.has(c) ? 0.15 : 0.6) * Math.min(4, d[c] / thr);
     }
+    // Den vorgeschlagenen (oder von Stockfish erwarteten) Zug bevorzugen: wird er gespielt,
+    // reicht schon eine schwächere Veränderung.
+    if (S.expect && m.from + m.to === S.expect.slice(0, 4)) score += 0.5;
     const cand = { m, score };
     if (DEBUG) (matchMove.log ||= []).push([m.san, score.toFixed(2), inv.map(([q]) => FILES[q % 8] + ((q >> 3) + 1) + ':' + (d[q] / thr).toFixed(1) + '/' + occ[q].toFixed(2)).join(' ')]);
     if (!best || score > best.score) { second = best; best = cand; } else if (!second || score > second.score) second = cand;
@@ -528,7 +537,7 @@ function trackStep(img) {
   const moving = Math.max(...motion) > Math.max(10, median(motion) * 3 + 6);
   if (moving) { S.stable = 0; S.evaluated = false; return; }
   S.stable++;
-  if (S.stable < 3) return;
+  if (S.stable < 2) return;
   if (S.evaluated) {
     // Passt die Stellung nicht, in Ruhe noch ein paar Mal nachsehen
     if (S.badStreak > 0 && S.stable % 7 === 0) verifyPosition(img, cur);
@@ -547,7 +556,7 @@ function trackStep(img) {
     return;
   }
   if (res.kind === 'unclear') {
-    if (verifyPosition(img, cur)) return;
+    if (verifyPosition(img, cur, true)) return;
     S.unclear = true;
     if (!S.inconsistent) setStatus('Zug nicht erkannt – tippe Start- und Zielfeld an', 'warn');
     return;
@@ -564,6 +573,9 @@ function trackStep(img) {
 function applyMove(m, cur) {
   const played = S.game.move({ from: m.from, to: m.to, promotion: 'q' });
   if (!played) return;
+  // Wurde der Vorschlag gespielt, kennt Stockfish schon die wahrscheinliche Antwort
+  const pv = S.pv;
+  S.expect = pv[0] && pv[0].slice(0, 4) === played.from + played.to ? pv[1] || null : null;
   S.lastMove = played;
   afterPositionChange(cur);
 }
@@ -599,7 +611,7 @@ function cloneGame(game) {
 // Prüft, ob das Bild zur verfolgten Stellung passt. Passt es nicht, sucht es die Zugfolge
 // (bis zu 3 Halbzüge, auch mit Korrektur des letzten Zuges), die das Bild am besten erklärt.
 // Gibt true zurück, wenn die Stellung dabei geändert wurde.
-function verifyPosition(img, cur) {
+function verifyPosition(img, cur, urgent = false) {
   if (!S.model.ready) {
     if (S.needLearn && S.game.history().length) learn(img, cur);
     return false;
@@ -620,7 +632,7 @@ function verifyPosition(img, cur) {
     return false;
   }
   S.badStreak++;
-  if (S.badStreak < 2) return false; // einmal abwarten: Hand, Schatten
+  if (S.badStreak < 2 && !urgent) return false; // einmal abwarten: Hand, Schatten
   // Dieselbe Abweichung nicht immer wieder durchsuchen
   const key = S.game.fen() + '|' + mism.join(',');
   let fix = null;
@@ -639,6 +651,12 @@ function verifyPosition(img, cur) {
     S.notice = { text: `Erkannt: ${fix.seq.map((m) => m.san).join(', ') || 'letzter Zug zurückgenommen'}`, until: performance.now() + 5000 };
     afterPositionChange(cur);
     return true;
+  }
+  // Hält der Widerspruch an, die Stellung selbst neu einlesen (die bisherige hilft als Vorwissen)
+  if (S.badStreak >= 4 && S.model.ready && S.templates.ready) {
+    if (S.cv) followBoard(img);
+    const scan = scanPosition(img);
+    if (scan && applyScan(scan)) return true;
   }
   if (mism.length >= 2 || S.badStreak >= 3) {
     if (!S.inconsistent) {
@@ -703,7 +721,7 @@ function learn(img, cur, feats) {
   const board = S.game.board();
   for (let sq = 0; sq < 64; sq++) {
     const p = board[7 - (sq >> 3)][sq % 8];
-    if (p) S.templates.add(p.color, p.type, cropPatch(img, proj, sq), isDark(sq));
+    if (p && !S.fromScan) S.templates.add(p.color, p.type, cropPatch(img, proj, sq), isDark(sq));
   }
   S.needLearn = false;
   saveModel(S.model, S.templates);
@@ -755,6 +773,30 @@ function scanPosition(img) {
 
 const PIECE_CYCLE = [null, ...['w', 'b'].flatMap((c) => ['p', 'n', 'b', 'r', 'q', 'k'].map((t) => ({ color: c, type: t })))];
 
+// Eingelesene Stellung ohne Rückfrage übernehmen; korrigieren geht über die Statuszeile.
+// Am Zug ist zuerst die eigene Farbe, sonst die andere, je nachdem, was regelkonform ist.
+function applyScan(scan) {
+  const mine = S.myColor === 'b' ? 'b' : 'w';
+  for (const turn of [mine, mine === 'w' ? 'b' : 'w']) {
+    let g;
+    try { g = new Chess(toFen(scan.pieces, turn)); } catch { continue; }
+    setBoard(S.quad, scan.o);
+    S.game = g; S.lastMove = null; S.lastScan = scan; S.expect = null;
+    S.fromScan = true;
+    S.notice = { text: 'Stellung eingelesen', until: performance.now() + 5000 };
+    S.correctUntil = performance.now() + 10000;
+    afterPositionChange(null);
+    return true;
+  }
+  return false;
+}
+
+function currentPieces() {
+  const pieces = new Map(), board = S.game.board();
+  for (let sq = 0; sq < 64; sq++) { const p = board[7 - (sq >> 3)][sq % 8]; if (p) pieces.set(sq, { color: p.color, type: p.type }); }
+  return pieces;
+}
+
 function openScanDialog(scan) {
   S.scan = { o: scan.o, pieces: new Map(scan.pieces) };
   $('#scanTurn').value = S.myColor === 'b' ? 'b' : 'w';
@@ -796,6 +838,7 @@ $('#btnScanOk').addEventListener('click', () => {
   }
   setBoard(S.quad, S.scan.o);
   S.game = g; S.lastMove = null; S.scan = null;
+  S.fromScan = false; S.correctUntil = 0;
   $('#scan').hidden = true;
   resetTracking();
   S.inconsistent = false; S.mismatch = []; S.needLearn = true;
@@ -808,14 +851,15 @@ $('#btnScanRetry').addEventListener('click', () => {
 });
 $('#btnScanCancel').addEventListener('click', () => { S.scan = null; $('#scan').hidden = true; });
 
-function startScan() {
+function startScan(auto = false) {
   if (!S.quad) { setStatus('Erst muss das Brett erkannt sein', 'warn'); return; }
   if (!S.model.ready || !S.templates.ready) {
     setStatus('Noch kein Figurenset gelernt – einmal mit Grundstellung starten', 'warn');
     return;
   }
   const scan = scanPosition(grab());
-  if (scan) openScanDialog(scan);
+  if (!scan) return;
+  if (!auto || !applyScan(scan)) openScanDialog(scan);
 }
 
 /* ---------- Stockfish ---------- */
@@ -853,8 +897,10 @@ function go(fen) {
 function onInfo(line) {
   engine.info = line;
   if (engine.next || engine.fen !== S.game.fen()) return;
+  const pv = line.match(/ pv (.+)$/)?.[1].split(' ');
+  if (pv) S.pv = pv;
   const depth = Number(line.match(/ depth (\d+)/)?.[1] || 0);
-  if (depth < 8) return;
+  if (depth < 6) return;
   const uci = line.match(/ pv (\S+)/)?.[1];
   if (uci && (!S.best || S.best.uci !== uci)) setBest(uci, false);
 }
@@ -872,6 +918,7 @@ function setBest(uci, final) {
   try { m = probe.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || 'q' }); } catch { return; }
   if (!m) return;
   S.best = { uci, from: m.from, to: m.to, san: m.san, piece: m.piece, color: m.color, promotion: m.promotion, final };
+  S.expect = uci;
   S.evalText = describeEval(engine.info, m.color);
   renderSuggestion();
   if (!S.unclear) idleStatus();
@@ -896,8 +943,9 @@ function describeEval(info, side) {
 
 function requestSuggestion() {
   S.best = null;
+  S.pv = [];
   const g = S.game;
-  $('#btnUndo').hidden = g.history().length === 0;
+  $('#btnUndo').disabled = g.history().length === 0;
   if (g.isGameOver()) {
     renderSuggestion(g.isCheckmate() ? `Schachmatt – ${g.turn() === 'w' ? 'Schwarz' : 'Weiß'} gewinnt` : 'Remis');
     return;
@@ -919,7 +967,10 @@ function setStatus(text, tone = 'idle') {
   $('#status').hidden = tone === 'ok';
 }
 
-function idleStatus() { setStatus('', 'ok'); }
+function idleStatus() {
+  if (S.correctUntil > performance.now()) setStatus('Stellung eingelesen – hier tippen zum Korrigieren', 'info');
+  else setStatus('', 'ok');
+}
 
 function moveText(b) {
   if (b.san.startsWith('O-O-O')) return 'Lange Rochade';
@@ -979,6 +1030,7 @@ function squarePoly(name, vm, inset = 0) {
 function draw(t) {
   requestAnimationFrame(draw);
   if (S.notice && S.notice.until <= performance.now()) { S.notice = null; renderSuggestion(); }
+  if (S.correctUntil && S.correctUntil <= performance.now()) { S.correctUntil = 0; if ($('#status').dataset.tone === 'info') idleStatus(); }
   const dpr = window.devicePixelRatio || 1;
   const cw = overlay.clientWidth, ch = overlay.clientHeight;
   if (overlay.width !== Math.round(cw * dpr) || overlay.height !== Math.round(ch * dpr)) { overlay.width = Math.round(cw * dpr); overlay.height = Math.round(ch * dpr); }
@@ -1050,21 +1102,39 @@ function draw(t) {
 // Jede bekannte Figur bekommt einen Ring, der flach auf ihrem Feld liegt (perspektivisch
 // mit der Brettebene verzerrt), damit man sieht, was die App wo vermutet.
 const RING = Array.from({ length: 28 }, (_, i) => [Math.cos((i / 28) * Math.PI * 2), Math.sin((i / 28) * Math.PI * 2)]);
+// Dazu ein kleines Symbol der Figurenart am vorderen Rand des Rings (die Figur selbst
+// verdeckt die Feldmitte).
 function drawPieces(vm) {
   const board = S.game.board();
+  const badges = [];
   octx.save();
-  octx.lineWidth = 2;
   for (let r = 0; r < 8; r++) for (let f = 0; f < 8; f++) {
     const p = board[7 - r][f];
     if (!p) continue;
     const pts = RING.map(([c, s]) => boardToScreen(f + 0.5 + c * 0.36, r + 0.5 + s * 0.36, vm));
     polyPath(pts);
     if (p.color === 'w') {
-      octx.strokeStyle = 'rgba(255,255,255,0.8)'; octx.stroke();
+      octx.strokeStyle = 'rgba(255,255,255,0.8)'; octx.lineWidth = 2; octx.stroke();
     } else {
       octx.strokeStyle = 'rgba(255,255,255,0.35)'; octx.lineWidth = 4; octx.stroke();
       octx.strokeStyle = 'rgba(20,24,30,0.9)'; octx.lineWidth = 2; octx.stroke();
     }
+    const front = pts.reduce((a, b) => (b[1] > a[1] ? b : a));
+    const xs = pts.map((q) => q[0]);
+    badges.push({ p, x: front[0], y: front[1], size: Math.max(...xs) - Math.min(...xs) });
+  }
+  // Symbole nach den Ringen zeichnen, von hinten nach vorne
+  badges.sort((a, b) => a.y - b.y);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  for (const { p, x, y, size } of badges) {
+    const rad = Math.max(8, Math.min(15, size * 0.22));
+    octx.beginPath(); octx.arc(x, y, rad, 0, Math.PI * 2);
+    octx.fillStyle = p.color === 'w' ? 'rgba(250,250,247,0.95)' : 'rgba(22,26,32,0.95)';
+    octx.fill();
+    octx.lineWidth = 1; octx.strokeStyle = p.color === 'w' ? 'rgba(0,0,0,0.35)' : 'rgba(255,255,255,0.45)'; octx.stroke();
+    octx.fillStyle = p.color === 'w' ? '#1a1d22' : '#f4f4f0';
+    octx.font = `${Math.round(rad * 1.45)}px -apple-system, "Segoe UI Symbol", sans-serif`;
+    octx.fillText(GLYPH[p.type], x, y + rad * 0.08);
   }
   octx.restore();
 }
@@ -1153,7 +1223,7 @@ function drawDebug(img) {
 
 function loop(t) {
   requestAnimationFrame(loop);
-  const interval = S.mode === 'search' ? 220 : 140;
+  const interval = S.mode === 'search' ? 200 : 110;
   if (t - S.lastTick < interval) return;
   S.lastTick = t;
   if (S.mode !== 'search' && S.mode !== 'track') return;
@@ -1175,6 +1245,7 @@ function startSearch() {
 function enterTrack() {
   S.mode = 'track'; resetTracking();
   $('#panel').hidden = false;
+  $('#bottombar').hidden = false;
   idleStatus();
   requestSuggestion();
 }
@@ -1283,7 +1354,10 @@ $('#btnForget').addEventListener('click', () => {
   if (S.inconsistent) { S.inconsistent = false; idleStatus(); requestSuggestion(); }
   updateLearnInfo();
 });
-const statusTap = () => { if (S.inconsistent) startScan(); };
+const statusTap = () => {
+  if (S.inconsistent) { startScan(true); return; }
+  if (S.correctUntil > performance.now()) { S.correctUntil = 0; idleStatus(); openScanDialog({ o: S.a1, pieces: currentPieces() }); }
+};
 $('#status').addEventListener('click', statusTap);
 $('#status').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') statusTap(); });
 $('#btnClose').addEventListener('click', closeSettings);
@@ -1302,7 +1376,7 @@ $('#btnFen').addEventListener('click', () => {
   requestSuggestion(); closeSettings();
 });
 $('#btnNew').addEventListener('click', () => {
-  S.game = new Chess(); S.lastMove = null; resetTracking();
+  S.game = new Chess(); S.lastMove = null; S.fromScan = false; S.correctUntil = 0; resetTracking();
   requestSuggestion(); closeSettings();
 });
 $('#btnManual').addEventListener('click', () => {
@@ -1330,6 +1404,17 @@ $('#btnAdjust').addEventListener('click', () => {
   if (!S.quad) return;
   S.mode = 'adjust';
   setStatus('Ecken ziehen · daneben tippen zum Beenden', 'search');
+});
+// Beenden: Kamera aus, zurück zum Startbildschirm. Die Partie bleibt im Speicher und hilft
+// beim nächsten Einlesen.
+$('#btnStop').addEventListener('click', () => {
+  S.stream?.getTracks().forEach((t) => t.stop());
+  S.stream = null; video.srcObject = null;
+  S.mode = 'idle'; S.fresh = true; S.best = null; S.correctUntil = 0;
+  engine.worker?.postMessage('stop');
+  $('#panel').hidden = true; $('#bottombar').hidden = true; $('#status').hidden = true;
+  $('#introMsg').textContent = '';
+  $('#intro').hidden = false;
 });
 $('#btnRedetect').addEventListener('click', () => { closeSettings(); S.best = null; startSearch(); });
 

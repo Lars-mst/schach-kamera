@@ -16,7 +16,6 @@
   <header id="topbar">
     <div id="status" class="pill" data-tone="idle" role="button" tabindex="0" hidden><span class="dot"></span><span id="statusText"></span></div>
     <div class="top-actions">
-      <button id="btnUndo" class="icon-btn" aria-label="Letzten Zug zurücknehmen" hidden>↶</button>
       <button id="btnSettings" class="icon-btn" aria-label="Einstellungen">⚙︎</button>
     </div>
   </header>
@@ -25,6 +24,11 @@
     <div id="sugMove">–</div>
     <div id="sugMeta"></div>
   </section>
+
+  <nav id="bottombar" hidden>
+    <button id="btnUndo" class="bar-btn" disabled>↶ Zug zurück</button>
+    <button id="btnStop" class="bar-btn">Beenden</button>
+  </nav>
 
   <section id="intro">
     <h1>Schach Kamera</h1>
@@ -71,7 +75,7 @@
       <label class="field">Bedenkzeit Stockfish
         <select id="thinkSelect">
           <option value="300">schnell (0,3 s)</option>
-          <option value="800" selected>normal (0,8 s)</option>
+          <option value="500" selected>normal (0,5 s)</option>
           <option value="2000">stark (2 s)</option>
         </select>
       </label>

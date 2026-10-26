@@ -7,7 +7,7 @@
 
 export const CLASSES = ['e', 'w', 'b'];
 const TYPES = ['p', 'n', 'b', 'r', 'q', 'k'];
-const STORE_KEY = 'schachkamera.modell.v2';
+const STORE_KEY = 'schachkamera.modell.v3';
 const F = 5;                       // Merkmale pro Feld
 const VAR_FLOOR = [36, 0.004, 0.004, 9, 9];
 export const PATCH_W = 12, PATCH_H = 24;
@@ -132,18 +132,43 @@ export function cropPatch(img, project, sq) {
   const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
   const x0 = Math.min(...xs), x1 = Math.max(...xs), y1 = Math.max(...ys), yt = Math.min(...ys);
   const w = x1 - x0, top = yt - 0.6 * w, h = y1 - top;
-  const out = new Float32Array(PATCH_W * PATCH_H);
-  let s = 0;
+  // Grauwerte in doppelter Auflösung abtasten, daraus Helligkeitsmuster und Kantenrichtungen
+  const W2 = PATCH_W * 2, H2 = PATCH_H * 2;
+  const g = new Float32Array(W2 * H2);
+  for (let j = 0; j < H2; j++) for (let i = 0; i < W2; i++) g[j * W2 + i] = bilinear(img, x0 + ((i + 0.5) / W2) * w, top + ((j + 0.5) / H2) * h);
+  const raw = new Float32Array(PATCH_W * PATCH_H);
   for (let j = 0; j < PATCH_H; j++) for (let i = 0; i < PATCH_W; i++) {
-    const v = bilinear(img, x0 + ((i + 0.5) / PATCH_W) * w, top + ((j + 0.5) / PATCH_H) * h);
-    out[j * PATCH_W + i] = v; s += v;
+    const k = 2 * j * W2 + 2 * i;
+    raw[j * PATCH_W + i] = (g[k] + g[k + 1] + g[k + W2] + g[k + W2 + 1]) / 4;
   }
-  const m = s / out.length;
-  let n2 = 0;
-  for (let k = 0; k < out.length; k++) { out[k] -= m; n2 += out[k] * out[k]; }
-  const n = Math.sqrt(n2) || 1;
-  for (let k = 0; k < out.length; k++) out[k] /= n;
+  normalize(raw, true);
+  // Kantenrichtungen (HOG): Zellen 4x4 Pixel, 6 Richtungen. Unabhängiger von Licht und Feldfarbe.
+  const CW = W2 / 4, CH = H2 / 4, BINS = 6;
+  const hog = new Float32Array(CW * CH * BINS);
+  for (let j = 1; j < H2 - 1; j++) for (let i = 1; i < W2 - 1; i++) {
+    const gx = g[j * W2 + i + 1] - g[j * W2 + i - 1], gy = g[(j + 1) * W2 + i] - g[(j - 1) * W2 + i];
+    const mag = Math.hypot(gx, gy);
+    if (mag < 1) continue;
+    let a = Math.atan2(gy, gx); if (a < 0) a += Math.PI;
+    const b = Math.min(BINS - 1, Math.floor((a / Math.PI) * BINS));
+    hog[((j >> 2) * CW + (i >> 2)) * BINS + b] += Math.sqrt(mag);
+  }
+  normalize(hog, false);
+  // Zusammen ergibt das Skalarprodukt 0,3 · Helligkeit + 0,7 · Kanten
+  const out = new Float32Array(PATCH_LEN);
+  const a = Math.sqrt(0.3), b = Math.sqrt(0.7);
+  raw.forEach((v, k) => { out[k] = v * a; });
+  hog.forEach((v, k) => { out[raw.length + k] = v * b; });
   return out;
+}
+
+const PATCH_LEN = PATCH_W * PATCH_H + (PATCH_W / 2) * (PATCH_H / 2) * 6;
+
+function normalize(v, center) {
+  if (center) { let m = 0; v.forEach((x) => { m += x; }); m /= v.length; for (let k = 0; k < v.length; k++) v[k] -= m; }
+  let n2 = 0; v.forEach((x) => { n2 += x * x; });
+  const n = Math.sqrt(n2) || 1;
+  for (let k = 0; k < v.length; k++) v[k] /= n;
 }
 
 const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
