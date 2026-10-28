@@ -2,7 +2,7 @@
 // besten Zug berechnen (Stockfish WASM) und perspektivisch korrekt ins Kamerabild zeichnen.
 import { Chess } from './lib/chess.js';
 import { CLASSES, ColorModel, TemplateStore, classMap, colorFeatures, cropPatch, loadModel, saveModel, forgetModel, assignTypes, toFen, plausibility } from './vision.js';
-import { PieceNet, ProtoStore, NET_CLASSES, NET_EMPTY, colorProbs, combinedTypeProbs } from './piecenet.js';
+import { PieceNet, Adapter, NET_CLASSES, NET_EMPTY, colorProbs, typeProbs } from './piecenet.js';
 
 const $ = (s) => document.querySelector(s);
 const video = $('#video');
@@ -61,6 +61,7 @@ const S = {
   scanState: 'ok',       // ok | hand | cam: für die kleine Statusanzeige
   alts: [],              // weitere gute Züge (MultiPV)
   showAlts: false,
+  showPieces: true,
   diag: false,           // Diagnoseansicht
   flash: null,           // { squares, at }: gerade erkannter Zug
   pv: [],                // Hauptvariante von Stockfish zur aktuellen Stellung
@@ -70,7 +71,12 @@ const S = {
   lastScan: null,
   searchKey: null,       // zuletzt erfolglos durchsuchte Abweichung
   net: null,             // trainiertes Figurennetz (lädt im Hintergrund)
-  protos: ProtoStore.load(), // Merkmale des eigenen Figurensets für das Netz
+  adapter: null,         // an das eigene Figurenset angepasste letzte Netzschicht
+  live: null,            // über mehrere Kamerabilder zusammengeführte Netz-Ergebnisse je Feld
+  liveBusy: false,
+  posAt: 0,              // Zeitpunkt der letzten Stellungsänderung
+  lastPieces: null,
+  adaptAt: 0,
   netCheckAt: 0,
   netStreak: new Map(),  // Feld+Figurenart -> wie oft das Netz hintereinander widersprochen hat
   diagNet: null,         // letzte Einschätzung des Netzes je Feld (Diagnose)
@@ -131,6 +137,7 @@ const cornersFrom = (quad, a1) => [0, 1, 2, 3].map((i) => quad[(a1 + i) % 4]);
 
 function setBoard(quad, a1) {
   const turned = a1 !== S.a1 || !S.colorDecided;
+  if (a1 !== S.a1) liveReset(); // Feldnamen ändern sich: Gesammeltes passt nicht mehr
   S.quad = quad;
   S.a1 = a1;
   S.H = homography(BOARD_CORNERS, cornersFrom(quad, a1));
@@ -327,10 +334,38 @@ function onBoardLocked(img, found) {
   S.outerT = found.t;
   setBoard(found.grid, guessOrientation(img, found.grid, found.darkParity));
   if (!canScan()) { startFromImage(img, null); return; }
-  // Stellung einlesen (das Netz rechnet im Hintergrund); solange ruht die Zugerkennung
+  if (!S.net) {
+    S.mode = 'scan-wait';
+    scanPosition(img).then((scan) => { if (S.mode === 'scan-wait') startFromImage(img, scan); });
+    return;
+  }
+  beginScanning();
+}
+
+// Stellung live einlesen: Das Netz schaut sich mehrere Kamerabilder an, die Ergebnisse werden
+// zusammengeführt (so stören einzelne unscharfe Bilder, Reflexe oder eine Hand nicht).
+const LIVE_FRAMES = 4;
+function beginScanning() {
+  liveReset();
   S.mode = 'scanning';
-  setStatus('Lese Stellung ein …', 'search');
-  scanPosition(img).then((scan) => { if (S.mode === 'scanning') startFromImage(img, scan); });
+  S.scanStart = performance.now();
+  S.scanPrev = null;
+  setStatus('Erkenne Figuren …', 'search');
+}
+
+function scanningStep(img) {
+  // Bewegung (Hand, Kamera) abwarten, nur ruhige Bilder zählen
+  const f = features(img);
+  const moving = S.scanPrev && Math.max(...squareDiffs(f, S.scanPrev)) > 14;
+  S.scanPrev = f;
+  if (!moving) liveStep(img);
+  const n = S.live?.frames || 0;
+  if (n < LIVE_FRAMES && performance.now() - S.scanStart < 8000) {
+    setStatus(`Erkenne Figuren … ${Math.min(99, Math.round((n / LIVE_FRAMES) * 100))} %`, 'search');
+    return;
+  }
+  S.mode = 'scan-wait';
+  scanPosition(img).then((scan) => { if (S.mode === 'scan-wait') startFromImage(img, scan); });
 }
 
 function startFromImage(img, scan) {
@@ -338,7 +373,7 @@ function startFromImage(img, scan) {
     setBoard(S.quad, scan.o);
     enterTrack();
     // Sieht die Belegung aus wie die Grundstellung, ist es die Grundstellung (auch wenn eine Figurenart wackelt)
-    if (looksLikeStart(scan.pieces)) { S.game = new Chess(); S.lastMove = null; S.fromScan = false; S.needLearn = true; requestSuggestion(); }
+    if (looksLikeStart(scan.pieces)) { S.game = new Chess(); S.lastMove = null; S.fromScan = false; S.needLearn = true; markPositionChange(); requestSuggestion(); }
     else if (!applyScan(scan)) openScanDialog(scan);
     return;
   }
@@ -354,9 +389,9 @@ function manualBoard(quad) {
   setBoard(quad, img && r ? guessOrientation(img, quad, r.darkParity) : 3);
   if (!S.fresh || !img || !canScan()) { enterTrack(); return; }
   S.fresh = false;
-  S.mode = 'scanning';
-  setStatus('Lese Stellung ein …', 'search');
-  scanPosition(img).then((scan) => { if (S.mode === 'scanning') startFromImage(img, scan); });
+  if (S.net) { beginScanning(); return; }
+  S.mode = 'scan-wait';
+  scanPosition(img).then((scan) => { if (S.mode === 'scan-wait') startFromImage(img, scan); });
 }
 
 // Einlesen geht mit dem trainierten Netz sofort, sonst erst mit gelerntem Figurenset
@@ -611,21 +646,12 @@ function retypeMove(scoreOf, d, thr) {
 // Das Netz schaut in Ruhephasen regelmäßig auf alle Figuren. Stammt die Stellung aus einem Scan
 // und widerspricht es bei einer Figur mehrmals hintereinander sehr deutlich, wird die Figurenart
 // korrigiert (nie beim König, und nur wenn die Stellung danach regelgerecht ist).
-function netCheckTypes(img) {
+function netCheckTypes() {
   const now = performance.now();
-  if (!S.net || now - S.netCheckAt < (S.fromScan ? 2500 : 4000)) return;
-  if (!S.fromScan && !S.diag) return;
-  if (S.netBusy) return;
+  if (!S.net || !S.live || S.live.frames < 2 || now - S.netCheckAt < 1500) return;
+  if (S.live.at < S.posAt) return; // noch kein Bild seit dem letzten Zug
   S.netCheckAt = now;
-  S.netBusy = true;
-  const pieces = currentPieces();
-  const fen = S.game.fen(), H = S.H;
-  S.net.classifyAsync(img, (u, v) => project(H, u, v), [...pieces.keys()]).then((res) => {
-    S.netBusy = false;
-    if (S.game.fen() !== fen || S.H !== H) return; // inzwischen gezogen oder Brett nachgeführt
-    S.diagNet = res;
-    if (S.fromScan && S.mode === 'track' && !S.inconsistent) netCorrectTypes(pieces, res);
-  });
+  if (S.fromScan && S.mode === 'track' && !S.inconsistent) netCorrectTypes(currentPieces(), liveMap());
 }
 
 function netCorrectTypes(pieces, res) {
@@ -635,7 +661,7 @@ function netCorrectTypes(pieces, res) {
     const r = res.get(sq);
     const cp = colorProbs(r.probs);
     if (cp[p.color] < 0.6) continue; // Netz ist sich bei der Farbe unsicher (Hand, Schatten): nichts ableiten
-    const tp = combinedTypeProbs(r.probs, r.emb, p.color, S.protos);
+    const tp = typeProbs(r.probs, p.color);
     const bt = Object.keys(tp).reduce((a, b) => (tp[a] > tp[b] ? a : b));
     if (bt === p.type || bt === 'k' || tp[bt] < 0.85 || tp[p.type] > 0.05) continue;
     if (bt === 'p' && (sq >> 3) % 7 === 0) continue;
@@ -643,7 +669,7 @@ function netCorrectTypes(pieces, res) {
     seen.add(key);
     const n = (S.netStreak.get(key) || 0) + 1;
     S.netStreak.set(key, n);
-    if (n < 3) continue;
+    if (n < 2) continue;
     const name = FILES[sq % 8] + ((sq >> 3) + 1);
     const g = new Chess(S.game.fen());
     g.remove(name);
@@ -652,6 +678,7 @@ function netCorrectTypes(pieces, res) {
     try { ok = new Chess(g.fen()); } catch { /* nicht regelgerecht */ }
     if (!ok) continue;
     S.game = ok;
+    markPositionChange();
     S.notice = { text: `Figur korrigiert: ${PIECE_DE[bt]} statt ${PIECE_DE[p.type]} auf ${name}`, until: performance.now() + 5000 };
     S.netStreak.clear();
     S.best = null;
@@ -669,8 +696,8 @@ function typeFit(color, type, square) {
     // Mehrere Züge können dasselbe Zielfeld haben: Ergebnis je Bild und Feld nur einmal rechnen
     if (S.netCache?.img !== S.lastImg) S.netCache = { img: S.lastImg, map: new Map() };
     let r = S.netCache.map.get(sq);
-    if (!r) { r = netClassify(S.lastImg, [sq]).get(sq); S.netCache.map.set(sq, r); }
-    return combinedTypeProbs(r.probs, r.emb, color, S.protos)[type];
+    if (!r) { const x = netClassify(S.lastImg, [sq]).get(sq); r = { probs: adaptedProbs(x) }; S.netCache.map.set(sq, r); }
+    return typeProbs(r.probs, color)[type];
   }
   if (!S.templates.ready) return 0.5;
   const sims = S.templates.similarities(color, cropPatch(S.lastImg, (u, v) => project(S.H, u, v), sq), isDark(sq));
@@ -745,11 +772,12 @@ function trackStep(img) {
   if (moving) { S.stable = 0; S.evaluated = false; S.scanState = 'hand'; return; }
   S.scanState = 'ok';
   S.stable++;
+  liveStep(img);
   if (S.stable < 2) return;
   if (S.evaluated) {
     // Passt die Stellung nicht, in Ruhe noch ein paar Mal nachsehen
     if (S.badStreak > 0 && S.stable % 7 === 0) verifyPosition(img, cur);
-    else if (S.badStreak === 0) netCheckTypes(img);
+    else if (S.badStreak === 0) netCheckTypes();
     return;
   }
   S.evaluated = true;
@@ -793,6 +821,21 @@ function trackStep(img) {
   applyMove(res.move, cur);
 }
 
+// Live-Erkennung: auf Feldern, deren Figur sich geändert hat, neu sammeln
+function markPositionChange() {
+  S.posAt = performance.now();
+  const now = currentPieces(), before = S.lastPieces;
+  if (before) {
+    const changed = [];
+    for (let sq = 0; sq < 64; sq++) {
+      const a = before.get(sq), b = now.get(sq);
+      if (!a !== !b || (a && (a.color !== b.color || a.type !== b.type))) changed.push(sq);
+    }
+    liveForget(changed);
+  }
+  S.lastPieces = now;
+}
+
 function applyMove(m, cur) {
   const played = S.game.move({ from: m.from, to: m.to, promotion: 'q' });
   if (!played) return;
@@ -805,6 +848,7 @@ function applyMove(m, cur) {
 }
 
 function afterPositionChange(cur) {
+  markPositionChange();
   S.ref = cur || null;
   S.prev = cur || null;
   S.unclear = false;
@@ -964,32 +1008,97 @@ function learn(img, cur, feats) {
     const p = board[7 - (sq >> 3)][sq % 8];
     if (p && !S.fromScan) S.templates.add(p.color, p.type, cropPatch(img, proj, sq), isDark(sq));
   }
-  if (S.net && !S.fromScan) learnProtos(img, board);
+  if (S.net && !S.fromScan) learnAdapter(board);
   S.needLearn = false;
   saveModel(S.model, S.templates);
   updateLearnInfo();
 }
 
-// Dem Netz das eigene Figurenset zeigen: je Figurenart und Farbe ein zufälliges Feld (hält es schnell)
-function learnProtos(img, board) {
-  const pick = new Map();
+// Dem Netz das eigene Figurenset zeigen: das letzte Live-Bild der jetzt sicher bekannten Stellung
+// liefert 64 Beispiele (Figuren und leere Felder). Höchstens alle 20 Sekunden, damit es flüssig bleibt.
+function learnAdapter(board) {
+  const now = performance.now();
+  if (!S.adapter || !S.live?.emb || S.live.at < S.posAt || (S.adapter.count && now - S.adaptAt < 20000)) return;
+  S.adaptAt = now;
+  const labels = [];
   for (let sq = 0; sq < 64; sq++) {
     const p = board[7 - (sq >> 3)][sq % 8];
-    if (!p) continue;
-    const k = p.color + p.type;
-    const list = pick.get(k) || [];
-    list.push(sq); pick.set(k, list);
+    labels.push(p ? (p.color === 'w' ? 0 : 6) + 'pnbrqk'.indexOf(p.type) : NET_EMPTY);
   }
-  const squares = [...pick.values()].map((l) => l[(Math.random() * l.length) | 0]);
-  const H = S.H;
-  S.net.classifyAsync(img, (u, v) => project(H, u, v), squares).then((res) => {
-    for (const sq of squares) {
-      const p = board[7 - (sq >> 3)][sq % 8];
-      S.protos.add(p.color, p.type, res.get(sq).emb);
+  const embs = new Map([...S.live.emb].map(([sq, e]) => [sq, e]));
+  setTimeout(() => { S.adapter.add(embs, labels); updateLearnInfo(); }, 0);
+}
+
+/* ---------- Live-Erkennung: Netz-Ergebnisse über mehrere Bilder ---------- */
+
+const ALL64 = [...Array(64).keys()];
+const hi = document.createElement('canvas');
+const hctx = hi.getContext('2d', { willReadFrequently: true });
+
+// Für das Netz ein schärferes Bild (bis 1280 Pixel breit) als für die übrige Bildverarbeitung
+function grabHi() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return null;
+  const w = Math.min(vw, 1280), h = Math.round((w * vh) / vw);
+  if (hi.width !== w || hi.height !== h) { hi.width = w; hi.height = h; }
+  hctx.drawImage(video, 0, 0, w, h);
+  return { img: hctx.getImageData(0, 0, w, h), k: w / WORK_W };
+}
+
+function liveReset() {
+  S.live = { L: new Float32Array(64 * 13), n: new Uint8Array(64), frames: 0, emb: null, at: 0, gen: (S.live?.gen || 0) + 1 };
+}
+
+// Wahrscheinlichkeiten des Netzes, mit der an das eigene Set angepassten letzten Schicht
+function adaptedProbs(r) {
+  return S.adapter?.ready ? S.adapter.probs(r.emb) : r.probs;
+}
+
+function liveStep(img) {
+  if (!S.net || !S.H || S.liveBusy) return;
+  if (!S.live) liveReset();
+  const H = S.H, gen = S.live.gen;
+  const src = (HIRES && grabHi()) || { img, k: 1 };
+  S.liveBusy = true;
+  S.net.classifyAsync(src.img, (u, v) => { const p = project(H, u, v); return [p[0] * src.k, p[1] * src.k]; }, ALL64).then((res) => {
+    S.liveBusy = false;
+    if (gen !== S.live.gen) return;
+    const L = S.live.L, n = S.live.n;
+    for (const [sq, r] of res) {
+      const p = adaptedProbs(r);
+      // gleitender Mittelwert der log-Wahrscheinlichkeiten; nach einer Änderung zählt das neue Bild voll
+      const a = n[sq] ? Math.max(0.3, 1 / (n[sq] + 1)) : 1;
+      for (let k = 0; k < 13; k++) L[sq * 13 + k] = (1 - a) * L[sq * 13 + k] + a * Math.log(Math.max(1e-4, p[k]));
+      n[sq] = Math.min(250, n[sq] + 1);
     }
-    S.protos.save();
-    updateLearnInfo();
+    S.live.emb = new Map([...res].map(([sq, r]) => [sq, r.emb]));
+    S.live.frames++;
+    S.live.at = performance.now();
+    S.diagNet = liveMap();
   });
+}
+const HIRES = !new URLSearchParams(location.search).has('lores');
+
+// Zusammengeführte Wahrscheinlichkeiten je Feld (Map sq -> { probs, emb })
+function liveMap() {
+  const out = new Map();
+  for (let sq = 0; sq < 64; sq++) {
+    if (!S.live.n[sq]) continue;
+    const row = S.live.L.subarray(sq * 13, sq * 13 + 13);
+    const m = Math.max(...row);
+    const p = new Float32Array(13);
+    let z = 0;
+    for (let k = 0; k < 13; k++) { p[k] = Math.exp(row[k] - m); z += p[k]; }
+    for (let k = 0; k < 13; k++) p[k] /= z;
+    out.set(sq, { probs: p, emb: S.live.emb?.get(sq) });
+  }
+  return out;
+}
+
+// Nach einem Zug: auf den Feldern, die sich geändert haben, von vorn sammeln
+function liveForget(squares) {
+  if (!S.live) return;
+  for (const sq of squares) S.live.n[sq] = 0;
 }
 
 // Netz auf einzelne Felder des aktuellen Bildes anwenden
@@ -998,7 +1107,7 @@ function netClassify(img, squares) {
 }
 
 function updateLearnInfo() {
-  const own = S.protos.ready('w') && S.protos.ready('b');
+  const own = S.adapter?.ready;
   $('#learnInfo').textContent = S.net
     ? (own ? 'Figurennetz aktiv und an dein Figurenset angepasst.' : 'Figurennetz aktiv: Stellungen werden sofort eingelesen. Mit der Grundstellung zu starten passt es zusätzlich an dein Figurenset an.')
     : S.model.ready && S.templates.ready
@@ -1014,7 +1123,12 @@ async function scanPosition(img) {
   const proj = (u, v) => project(H, u, v);
   // Das Netz sagt für jedes Feld leer / weiß / schwarz und die Figurenart. Zusammen mit dem
   // gelernten Farbmodell (falls vorhanden) entscheidet es über die Belegung.
-  const net = S.net ? await S.net.classifyAsync(img, proj, [...Array(64).keys()]) : null;
+  let net = null;
+  if (S.net) {
+    // Am liebsten die über mehrere Bilder zusammengeführten Ergebnisse, sonst dieses Bild
+    if (S.live?.frames >= 2 && liveMap().size === 64) net = liveMap();
+    else { const r = await S.net.classifyAsync(img, proj, ALL64); net = new Map([...r].map(([sq, x]) => [sq, { probs: adaptedProbs(x), emb: x.emb }])); }
+  }
   if (S.H !== H && S.quad) return null; // Brett wurde inzwischen neu ausgerichtet
   const cur = features(img);
   const ll = S.model.ready ? S.model.logLik(colorFeatures(cur, PER)) : new Float32Array(64 * 3);
@@ -1050,7 +1164,7 @@ async function scanPosition(img) {
   const sims = new Map();
   for (let sq = 0; sq < 64; sq++) {
     if (cls[sq] === 'e') continue;
-    if (net) { const r = net.get(sq); sims.set(sq, combinedTypeProbs(r.probs, r.emb, cls[sq], S.protos)); }
+    if (net) sims.set(sq, typeProbs(net.get(sq).probs, cls[sq]));
     else sims.set(sq, S.templates.similarities(cls[sq], cropPatch(img, proj, sq), isDark(sq)));
   }
   // Die zuletzt verfolgte Stellung hilft beim Zuordnen: was dort stand, steht oft noch da
@@ -1144,6 +1258,7 @@ $('#btnScanOk').addEventListener('click', () => {
   }
   setBoard(S.quad, S.scan.o);
   S.game = g; S.lastMove = null; S.scan = null;
+  markPositionChange();
   S.fromScan = false; S.correctUntil = 0;
   $('#scan').hidden = true;
   resetTracking();
@@ -1218,11 +1333,32 @@ function onInfo(line) {
   }
   engine.info = line;
   engine.depth = depth;
+  updateEvalBar(line);
   const pv = line.match(/ pv (.+)$/)?.[1].split(' ');
   if (pv) S.pv = pv;
   if (depth < 6) return;
   const uci = line.match(/ pv (\S+)/)?.[1];
   if (uci && (!S.best || S.best.uci !== uci)) setBest(uci, false);
+}
+
+// Bewertungsbalken am linken Rand: Anteil Weiß, aus Sicht von Weiß
+function updateEvalBar(line) {
+  const cp = line.match(/ score cp (-?\d+)/), mate = line.match(/ score mate (-?\d+)/);
+  if (!cp && !mate) return;
+  const sign = engine.fen.split(' ')[1] === 'w' ? 1 : -1;
+  let share, label;
+  if (mate) {
+    const n = Number(mate[1]) * sign;
+    share = n > 0 ? 1 : 0; label = `M${Math.abs(n)}`;
+  } else {
+    const v = (Number(cp[1]) * sign) / 100;
+    share = 1 / (1 + Math.exp(-v * 0.75));
+    label = (v > 0 ? '+' : '') + v.toFixed(1);
+  }
+  $('#evalfill').style.height = `${(share * 100).toFixed(1)}%`;
+  const num = $('#evalnum');
+  num.textContent = label;
+  num.className = share >= 0.5 ? 'w' : 'b';
 }
 
 function onBestMove(uci) {
@@ -1432,11 +1568,10 @@ function draw(t) {
   }
 }
 
-// Jede bekannte Figur bekommt einen Ring, der flach auf ihrem Feld liegt (perspektivisch
-// mit der Brettebene verzerrt), damit man sieht, was die App wo vermutet.
+// Erkannte Figuren als kleine, ruhige Schilder am vorderen Feldrand (die Figur selbst
+// verdeckt die Feldmitte). Nur die Figur des Vorschlags bekommt einen Ring auf ihrem Feld,
+// unsichere Felder werden orange gestrichelt. Ohne Beschriftung bleiben nur diese beiden.
 const RING = Array.from({ length: 28 }, (_, i) => [Math.cos((i / 28) * Math.PI * 2), Math.sin((i / 28) * Math.PI * 2)]);
-// Dazu ein kleines Symbol der Figurenart am vorderen Rand des Rings (die Figur selbst
-// verdeckt die Feldmitte). Gibt es einen Vorschlag, treten die übrigen Figuren zurück.
 function drawPieces(vm, focus) {
   const board = S.game.board();
   const badges = [];
@@ -1449,37 +1584,35 @@ function drawPieces(vm, focus) {
     const p = board[7 - r][f];
     if (!p) continue;
     const name = FILES[f] + (r + 1);
-    const hot = name === focus;
-    const pts = RING.map(([c, s]) => boardToScreen(f + 0.5 + c * 0.34, r + 0.5 + s * 0.34, vm));
-    if (doubt.has(f + 8 * r)) {
-      // unsicher: gestrichelt in Orange mit Fragezeichen
+    const hot = name === focus, unsure = doubt.has(f + 8 * r);
+    if (!S.showPieces && !hot && !unsure) continue;
+    const pts = RING.map(([c, s]) => boardToScreen(f + 0.5 + c * 0.36, r + 0.5 + s * 0.36, vm));
+    if (unsure || hot) {
       octx.globalAlpha = 0.95; polyPath(pts);
-      octx.setLineDash([4, 4]); octx.lineWidth = 2; octx.strokeStyle = cWarn; octx.stroke(); octx.setLineDash([]);
-      const front = pts.reduce((a, b) => (b[1] > a[1] ? b : a));
-      const xs = pts.map((q) => q[0]);
-      badges.push({ p, doubt: true, x: front[0], y: front[1], size: Math.max(...xs) - Math.min(...xs) });
-      continue;
+      octx.lineWidth = hot ? 2.5 : 2;
+      octx.strokeStyle = hot ? cMove : cWarn;
+      if (unsure) octx.setLineDash([4, 4]);
+      else { octx.shadowColor = cMove; octx.shadowBlur = 10; }
+      octx.stroke();
+      octx.setLineDash([]); octx.shadowBlur = 0;
     }
-    octx.globalAlpha = hot ? 1 : focus ? 0.45 : 0.75;
-    polyPath(pts);
-    octx.lineWidth = hot ? 2.5 : 1.5;
-    octx.strokeStyle = hot ? cMove : p.color === 'w' ? 'rgba(255,255,255,0.85)' : 'rgba(15,18,22,0.85)';
-    if (hot) { octx.shadowColor = cMove; octx.shadowBlur = 10; }
-    octx.stroke();
-    octx.shadowBlur = 0;
+    if (!S.showPieces && !unsure) continue;
     const front = pts.reduce((a, b) => (b[1] > a[1] ? b : a));
     const xs = pts.map((q) => q[0]);
-    badges.push({ p, hot, x: front[0], y: front[1], size: Math.max(...xs) - Math.min(...xs) });
+    badges.push({ p, hot, unsure, x: front[0], y: front[1], size: Math.max(...xs) - Math.min(...xs) });
   }
-  // Symbole nach den Ringen zeichnen, von hinten nach vorne
+  // Schilder von hinten nach vorne zeichnen
   badges.sort((a, b) => a.y - b.y);
   octx.textAlign = 'center'; octx.textBaseline = 'middle';
-  for (const { p, hot, doubt: unsure, x, y, size } of badges) {
-    const rad = Math.max(7, Math.min(13, size * 0.19));
-    octx.globalAlpha = hot || unsure ? 1 : focus ? 0.5 : 0.85;
+  for (const { p, hot, unsure, x, y, size } of badges) {
+    const rad = Math.max(6, Math.min(11, size * 0.16));
+    octx.globalAlpha = hot || unsure ? 1 : focus ? 0.45 : 0.7;
     octx.beginPath(); octx.arc(x, y, rad, 0, Math.PI * 2);
-    octx.fillStyle = unsure ? cWarn : hot ? cMove : p.color === 'w' ? 'rgba(250,250,247,0.92)' : 'rgba(18,21,26,0.88)';
+    octx.fillStyle = unsure ? cWarn : hot ? cMove : p.color === 'w' ? 'rgba(250,250,247,0.9)' : 'rgba(18,21,26,0.85)';
     octx.fill();
+    if (!unsure && !hot) {
+      octx.lineWidth = 1; octx.strokeStyle = p.color === 'w' ? 'rgba(0,0,0,0.25)' : 'rgba(255,255,255,0.35)'; octx.stroke();
+    }
     octx.fillStyle = unsure || hot || p.color === 'w' ? '#15181d' : '#f4f4f0';
     octx.font = `${unsure ? '700 ' : ''}${Math.round(rad * 1.4)}px -apple-system, "Segoe UI Symbol", sans-serif`;
     octx.fillText(unsure ? '?' : GLYPH[p.type], x, y + rad * 0.08);
@@ -1524,49 +1657,58 @@ function drawFlash(t, vm, color) {
   octx.restore();
 }
 
-// Vorschlag: Startfeld dezent, Zielfeld pulsiert, schlanker leuchtender Pfeil in der Brettebene.
+// Vorschlag wie in AR-Schach-Ansichten: ein breiter Pfeil, der flach auf dem Brett liegt (in
+// Brettkoordinaten gebaut und perspektivisch projiziert), Start- und Zielfeld dezent hinterlegt.
 function drawBest(t, vm, color) {
   const b = S.best;
-  const pulse = 0.5 + 0.5 * Math.sin(t / 300);
+  const pulse = 0.5 + 0.5 * Math.sin(t / 380);
   octx.save();
   octx.fillStyle = color; octx.strokeStyle = color;
-  octx.globalAlpha = 0.16; polyPath(squarePoly(b.from, vm, 0.06)); octx.fill();
-  octx.globalAlpha = 0.2 + 0.25 * pulse; polyPath(squarePoly(b.to, vm, 0.06)); octx.fill();
-  octx.shadowColor = color; octx.shadowBlur = 8 + 10 * pulse;
-  octx.globalAlpha = 0.95; octx.lineWidth = 2.5;
-  polyPath(squarePoly(b.to, vm, 0.06)); octx.stroke();
+  octx.globalAlpha = 0.22; polyPath(squarePoly(b.from, vm, 0.04)); octx.fill();
+  octx.globalAlpha = 0.18 + 0.14 * pulse; polyPath(squarePoly(b.to, vm, 0.04)); octx.fill();
+  octx.globalAlpha = 0.9; octx.lineWidth = 2;
+  polyPath(squarePoly(b.to, vm, 0.04)); octx.stroke();
 
-  // Springer laufen über die L-Form
   const f = [FILES.indexOf(b.from[0]) + 0.5, Number(b.from[1]) - 0.5];
   const to = [FILES.indexOf(b.to[0]) + 0.5, Number(b.to[1]) - 0.5];
   let path = [f, to];
   if (b.piece === 'n') {
+    // Springer: über die L-Form
     const dx = to[0] - f[0], dy = to[1] - f[1];
     path = Math.abs(dx) > Math.abs(dy) ? [f, [to[0], f[1]], to] : [f, [f[0], to[1]], to];
   }
-  const pts = path.map(([u, v]) => boardToScreen(u, v, vm));
-  const sqPx = Math.hypot(...[0, 1].map((k) => boardToScreen(to[0] + 0.5, to[1], vm)[k] - boardToScreen(to[0] - 0.5, to[1], vm)[k]));
-  const w = Math.max(4, sqPx * 0.1);
-  const [px, py] = pts[pts.length - 2], [ex, ey] = pts[pts.length - 1];
-  const ang = Math.atan2(ey - py, ex - px);
-  const head = w * 2.6;
-  const base = [ex - Math.cos(ang) * head, ey - Math.sin(ang) * head];
-  const [sx, sy] = pts[0];
-  const grad = octx.createLinearGradient(sx, sy, ex, ey);
-  grad.addColorStop(0, 'rgba(245,196,81,0.35)'); grad.addColorStop(1, color);
-  octx.globalAlpha = 1; octx.shadowBlur = 12;
-  octx.strokeStyle = grad; octx.lineWidth = w; octx.lineCap = 'round'; octx.lineJoin = 'round';
-  octx.beginPath();
-  pts.slice(0, -1).forEach(([x, y], i) => (i ? octx.lineTo(x, y) : octx.moveTo(x, y)));
-  octx.lineTo(base[0], base[1]);
-  octx.stroke();
-  octx.fillStyle = color;
-  octx.beginPath();
-  octx.moveTo(ex, ey);
-  octx.lineTo(base[0] + Math.cos(ang + Math.PI / 2) * w * 1.25, base[1] + Math.sin(ang + Math.PI / 2) * w * 1.25);
-  octx.lineTo(base[0] + Math.cos(ang - Math.PI / 2) * w * 1.25, base[1] + Math.sin(ang - Math.PI / 2) * w * 1.25);
-  octx.closePath(); octx.fill();
+  const poly = arrowPolygon(path, 0.11, 0.3, 0.42).map(([u, v]) => boardToScreen(u, v, vm));
+  octx.globalAlpha = 0.88;
+  octx.shadowColor = color; octx.shadowBlur = 14 + 8 * pulse;
+  polyPath(poly); octx.fill();
+  octx.shadowBlur = 0; octx.globalAlpha = 1;
+  octx.lineWidth = 1.5; octx.strokeStyle = 'rgba(255,255,255,0.75)';
+  polyPath(poly); octx.stroke();
   octx.restore();
+}
+
+// Pfeil als Umriss in Brettkoordinaten: Schaft (halbe Breite w) entlang des Pfads, Spitze mit
+// halber Breite hw und Länge hl. Der Start liegt etwas vor der Feldmitte.
+function arrowPolygon(path, w, hw, hl) {
+  const pts = path.map((p) => [...p]);
+  const dir = (a, b) => { const l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1; return [(b[0] - a[0]) / l, (b[1] - a[1]) / l]; };
+  const d0 = dir(pts[0], pts[1]);
+  pts[0] = [pts[0][0] + d0[0] * 0.2, pts[0][1] + d0[1] * 0.2];
+  const n = pts.length, dn = dir(pts[n - 2], pts[n - 1]);
+  const tip = [pts[n - 1][0] + dn[0] * 0.18, pts[n - 1][1] + dn[1] * 0.18];
+  const base = [tip[0] - dn[0] * hl, tip[1] - dn[1] * hl];
+  pts[n - 1] = base;
+  const left = [], right = [];
+  for (let i = 0; i < n; i++) {
+    const a = dir(pts[Math.max(0, i - 1)], pts[Math.max(1, i)]), c = dir(pts[Math.min(n - 2, i)], pts[Math.min(n - 1, i + 1)]);
+    let nx = -(a[1] + c[1]), ny = a[0] + c[0];
+    const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+    const miter = w / Math.max(0.5, nx * -c[1] + ny * c[0]);
+    left.push([pts[i][0] + nx * miter, pts[i][1] + ny * miter]);
+    right.push([pts[i][0] - nx * miter, pts[i][1] - ny * miter]);
+  }
+  const px = -dn[1], py = dn[0];
+  return [...left, [base[0] + px * hw, base[1] + py * hw], tip, [base[0] - px * hw, base[1] - py * hw], ...right.reverse()];
 }
 
 // Alternativen: dünne, halbtransparente Pfeile ohne Animation
@@ -1637,7 +1779,7 @@ function drawDiag(vm) {
     `Am Zug: ${S.game.turn() === 'w' ? 'Weiß' : 'Schwarz'} · Ich: ${S.myColor === 'both' ? 'beide' : S.myColor === 'w' ? 'Weiß' : 'Schwarz'}${S.colorAuto ? ' (auto)' : ''}`,
     `Erkennung: ${S.scanState} · ruhig ${S.stable} · Abweichungen ${S.mismatch.length}${S.inconsistent ? ' (unstimmig)' : ''}`,
     `Farbmodell ${S.model.ready ? 'gelernt' : 'fehlt'} · Figurenset ${S.templates.ready ? 'gelernt' : 'fehlt'}${S.fromScan ? ' · Stellung aus Scan' : ''}`,
-    `Figurennetz ${S.net ? 'aktiv' : 'lädt/fehlt'} · eigenes Set ${S.protos.ready('w') && S.protos.ready('b') ? 'angepasst' : 'noch nicht'}`,
+    `Figurennetz ${S.net ? 'aktiv' : 'lädt/fehlt'} · Live-Bilder ${S.live?.frames || 0} · eigenes Set ${S.adapter?.ready ? `angepasst (${S.adapter.count} Beispiele)` : 'noch nicht'}`,
     `Stockfish T${engine.depth || 0}${S.pv.length ? ' · ' + S.pv.slice(0, 5).join(' ') : ''}`,
   ];
   $('#diagText').textContent = lines.join('\n');
@@ -1663,11 +1805,12 @@ function loop(t) {
   const interval = S.mode === 'search' ? 180 : 80;
   if (t - S.lastTick < interval) return;
   S.lastTick = t;
-  if (S.mode !== 'search' && S.mode !== 'track') return;
+  if (S.mode !== 'search' && S.mode !== 'track' && S.mode !== 'scanning') return;
   const img = grab();
   if (!img) return;
   try {
     if (S.mode === 'search') searchStep(img);
+    else if (S.mode === 'scanning') scanningStep(img);
     else trackStep(img);
   } catch (e) { console.error(e); }
 }
@@ -1675,12 +1818,14 @@ function loop(t) {
 function resetTracking() { S.ref = null; S.prev = null; S.stable = 0; S.evaluated = false; S.unclear = false; }
 
 function startSearch() {
+  $('#evalbar').hidden = true;
   S.mode = 'search'; S.cand = null; S.candHits = 0; resetTracking();
   setStatus('Suche Schachbrett …', 'search');
 }
 
 function enterTrack() {
   S.mode = 'track'; resetTracking();
+  $('#evalbar').hidden = false;
   $('#panel').hidden = false;
   $('#bottombar').hidden = false;
   idleStatus();
@@ -1792,6 +1937,7 @@ $('#btnStart').addEventListener('click', async () => {
 $('#btnSettings').addEventListener('click', () => { $('#fenInput').value = S.game.fen(); updateLearnInfo(); $('#settings').hidden = false; });
 $('#btnScan').addEventListener('click', () => { closeSettings(); startScan(); });
 $('#altToggle').addEventListener('change', (e) => { S.showAlts = e.target.checked; savePrefs(); requestSuggestion(); });
+$('#pieceToggle').addEventListener('change', (e) => { S.showPieces = e.target.checked; savePrefs(); });
 $('#diagToggle').addEventListener('change', (e) => { S.diag = e.target.checked; $('#diagText').hidden = !S.diag; savePrefs(); });
 $('#btnPgn').addEventListener('click', async () => {
   const pgn = S.game.pgn() || `[FEN "${S.game.fen()}"]`;
@@ -1802,16 +1948,18 @@ $('#btnLichess').addEventListener('click', () => {
   window.open('https://lichess.org/analysis/standard/' + S.game.fen().replace(/ /g, '_'), '_blank', 'noopener');
 });
 function savePrefs() {
-  try { localStorage.setItem('schachkamera.optionen', JSON.stringify({ alts: S.showAlts, diag: S.diag })); } catch { /* egal */ }
+  try { localStorage.setItem('schachkamera.optionen', JSON.stringify({ alts: S.showAlts, diag: S.diag, pieces: S.showPieces })); } catch { /* egal */ }
 }
 try {
   const o = JSON.parse(localStorage.getItem('schachkamera.optionen') || '{}');
-  S.showAlts = !!o.alts; S.diag = !!o.diag;
+  S.showAlts = !!o.alts; S.diag = !!o.diag; S.showPieces = o.pieces !== false;
+  $('#pieceToggle').checked = S.showPieces;
   $('#altToggle').checked = S.showAlts; $('#diagToggle').checked = S.diag; $('#diagText').hidden = !S.diag;
 } catch { /* egal */ }
 $('#btnForget').addEventListener('click', () => {
-  forgetModel(); ProtoStore.forget();
-  S.model = new ColorModel(); S.templates = new TemplateStore(); S.protos = new ProtoStore();
+  forgetModel(); Adapter.forget();
+  S.model = new ColorModel(); S.templates = new TemplateStore();
+  if (S.net) S.adapter = new Adapter(S.net);
   S.needLearn = true; S.mismatch = []; S.badStreak = 0;
   if (S.inconsistent) { S.inconsistent = false; idleStatus(); requestSuggestion(); }
   updateLearnInfo();
@@ -1834,11 +1982,11 @@ $('#btnFen').addEventListener('click', () => {
     $('#fenInput').setCustomValidity('Ungültige FEN'); $('#fenInput').reportValidity(); return;
   }
   $('#fenInput').setCustomValidity('');
-  S.lastMove = null; resetTracking();
+  S.lastMove = null; resetTracking(); markPositionChange();
   requestSuggestion(); closeSettings();
 });
 $('#btnNew').addEventListener('click', () => {
-  S.game = new Chess(); S.lastMove = null; S.fromScan = false; S.correctUntil = 0; resetTracking();
+  S.game = new Chess(); S.lastMove = null; S.fromScan = false; S.correctUntil = 0; resetTracking(); markPositionChange();
   requestSuggestion(); closeSettings();
 });
 $('#btnManual').addEventListener('click', () => {
@@ -1891,7 +2039,7 @@ renderSuggestion();
 updateLearnInfo();
 startEngine();
 waitForCv().then(({ cv }) => { S.cv = cv; });
-PieceNet.load().then((n) => { S.net = n; updateLearnInfo(); }).catch((err) => console.warn('Figurennetz nicht geladen', err));
+PieceNet.load().then((n) => { S.net = n; S.adapter = Adapter.load(n); updateLearnInfo(); }).catch((err) => console.warn('Figurennetz nicht geladen', err));
 requestAnimationFrame(loop);
 requestAnimationFrame(draw);
 if (DEBUG) window.__dbg = { findQuads, refineGrid, grab, guessOrientation, manualBoard,

@@ -1,8 +1,10 @@
 # Netzarchitektur (gemeinsam für Training und Export)
+import os
 import torch.nn as nn
 import torch.nn.functional as F
 
-CH = [12, 24, 24, 48, 48, 96]
+# Kanäle je Schicht (Standard: das Netz in src/model)
+CH = [int(c) for c in os.environ.get('NETZ_CH', '16,32,32,64,64,128').split(',')]
 
 
 class Net(nn.Module):

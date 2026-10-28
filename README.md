@@ -25,18 +25,30 @@ und zeigt den besten nächsten Zug (Stockfish) als Overlay direkt auf dem Brett.
    Stellung, sucht sie die Zugfolge (bis zu 3 Halbzüge, auch mit Korrektur des letzten Zuges), die
    das Bild erklärt. Findet sie keine, gibt es keinen Vorschlag, sondern einen Hinweis zum Neu-Einlesen.
 6. **Stellung einlesen mit dem Figurennetz**: Ein kleines, selbst trainiertes Faltungsnetz
-   (`src/piecenet.js`, Gewichte in `src/model/`, ca. 330 KB) bestimmt für jedes Feld „leer“ oder eine
+   (`src/piecenet.js`, Gewichte in `src/model/`, ca. 580 KB) bestimmt für jedes Feld „leer“ oder eine
    der 12 Figuren. Es läuft in reinem JavaScript in einem Web Worker, also ohne Zusatzbibliothek und
    auch auf dem iPhone. Damit liest die App jede Stellung sofort ein, ohne vorher etwas lernen zu
    müssen. Die Regeln (genau ein König je Seite, Figurenanzahl, Läuferfarben, Bauernlinien) legen
-   die endgültige Verteilung fest. Aus jeder sicher verfolgten Stellung merkt sich die App außerdem
-   die Netz-Merkmale deines Figurensets und gleicht neue Bilder zusätzlich damit ab (Anpassung an
-   Figuren, Brett und Licht). Stammt die Stellung aus einem Scan, prüft das Netz in Ruhephasen
-   laufend alle Figuren und korrigiert eine Figurenart, wenn es mehrmals hintereinander sehr deutlich
-   widerspricht (nie den König). Ohne Netz (z. B. Laden fehlgeschlagen) gilt das alte Verfahren mit
+   die endgültige Verteilung fest. Ohne Netz (z. B. Laden fehlgeschlagen) gilt das alte Verfahren mit
    Farbmodell und Bildvorlagen.
+7. **Live-Erkennung über mehrere Bilder** (Idee wie bei anderen Kamera-Projekten: zeitliche
+   Glättung statt Einzelbild): Sobald das Brett gefunden ist, klassifiziert das Netz in jedem
+   ruhigen Kamerabild alle 64 Felder aus einem höher aufgelösten Bild (bis 1280 px) und mittelt die
+   Ergebnisse je Feld (gleitender Mittelwert der Log-Wahrscheinlichkeiten). Eingelesen wird nach
+   vier ruhigen Bildern; Felder, auf denen gezogen wurde, fangen neu an. Während der Partie läuft
+   das weiter: Widerspricht das Netz einer gescannten Figurenart mehrmals deutlich, wird sie
+   korrigiert (nie der König, nur wenn die Stellung legal bleibt).
+8. **Anpassung an das eigene Set** (Idee aus chesscog: Feinabstimmung mit wenigen eigenen Bildern):
+   Aus sicher verfolgten Stellungen sammelt die App Netz-Merkmale je Figurenart (bis 48 je Klasse,
+   im Browser gespeichert) und trainiert damit direkt im Browser die letzte Netzschicht nach, eng an
+   den Originalgewichten gehalten. „Gelerntes vergessen“ setzt das zurück.
 7. **Nachführen**: Bewegt sich die Kamera, wird der Brettumriss laufend neu gesucht, die
-   Ausrichtung bleibt erhalten. Jede Figur bekommt einen perspektivischen Ring auf ihrem Feld.
+   Ausrichtung bleibt erhalten.
+9. **Anzeige**: Kamerabild als Hauptansicht, das Brett nur mit Eckwinkeln markiert. Der beste Zug
+   ist ein flacher, perspektivisch verzerrter Pfeil direkt auf dem echten Brett (Springer im L),
+   links ein Bewertungsbalken, unten eine kleine Karte mit dem Zug. Erkannte Figuren tragen ein
+   kleines Symbol am Feldrand (abschaltbar in den Einstellungen), unsichere Felder sind orange
+   gestrichelt.
 
 ## Lokal starten
 

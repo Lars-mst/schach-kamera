@@ -53,7 +53,7 @@ export class PieceNet {
     return out;
   }
 
-  // Ein Ausschnitt -> { probs (13), emb (Merkmalsvektor, Länge 1) }
+  // Ein Ausschnitt -> { probs (13), emb (Merkmalsvektor vor der letzten Schicht) }
   run(input) {
     let cur = input, H = this.inH, W = this.inW, C = 3, flip = 0;
     let emb = null;
@@ -78,9 +78,6 @@ export class PieceNet {
         let z = 0;
         for (let o = 0; o < l.out; o++) { logits[o] = Math.exp(logits[o] - m); z += logits[o]; }
         for (let o = 0; o < l.out; o++) logits[o] /= z;
-        let n2 = 0; for (const v of emb) n2 += v * v;
-        const nn = Math.sqrt(n2) || 1;
-        for (let i = 0; i < emb.length; i++) emb[i] /= nn;
         return { probs: logits, emb };
       }
     }
@@ -95,31 +92,43 @@ export class PieceNet {
     return out;
   }
 
-  // Wie classify, aber im Hintergrund (Web Worker). Ohne Worker rechnet es hier.
+  // Wie classify, aber im Hintergrund: die Felder werden auf mehrere Web Worker verteilt
+  // (je freiem Prozessorkern einer, höchstens drei). Ohne Worker rechnet es hier.
   classifyAsync(img, project, squares) {
-    if (!this.worker) {
+    if (!this.workers) {
+      this.workers = [];
+      this.pending = new Map();
+      this.nextId = 1;
+      const n = Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 2) - 1));
       try {
-        this.worker = new Worker(new URL('./networker.js', import.meta.url), { type: 'module' });
-        this.pending = new Map();
-        this.nextId = 1;
-        this.worker.onmessage = (e) => { const p = this.pending.get(e.data.id); this.pending.delete(e.data.id); p?.(e.data); };
-        this.worker.onerror = () => { this.worker = false; for (const p of this.pending.values()) p({ error: 'worker' }); this.pending.clear(); };
-      } catch { this.worker = false; }
+        for (let i = 0; i < n; i++) {
+          const w = new Worker(new URL('./networker.js', import.meta.url), { type: 'module' });
+          w.onmessage = (e) => { const p = this.pending.get(e.data.id); this.pending.delete(e.data.id); p?.(e.data); };
+          w.onerror = () => { this.workers = []; for (const p of this.pending.values()) p({ error: 'worker' }); this.pending.clear(); };
+          this.workers.push(w);
+        }
+      } catch { this.workers = []; }
     }
-    if (this.worker === false || !squares.length) return Promise.resolve(this.classify(img, project, squares));
+    if (!this.workers.length || !squares.length) return Promise.resolve(this.classify(img, project, squares));
     const size = 3 * this.inW * this.inH;
-    const inputs = new Float32Array(squares.length * size);
-    squares.forEach((sq, i) => this.crop(img, project, sq, inputs.subarray(i * size, (i + 1) * size)));
-    const id = this.nextId++;
-    return new Promise((resolve) => {
-      this.pending.set(id, (d) => {
-        if (d.error) { resolve(this.classify(img, project, squares)); return; }
-        const out = new Map(), k = d.probs.length / squares.length, e = d.embs.length / squares.length;
-        squares.forEach((sq, i) => out.set(sq, { probs: d.probs.subarray(i * k, (i + 1) * k), emb: d.embs.subarray(i * e, (i + 1) * e) }));
-        resolve(out);
-      });
-      this.worker.postMessage({ id, inputs, count: squares.length }, [inputs.buffer]);
-    });
+    const per = Math.ceil(squares.length / this.workers.length);
+    const parts = [];
+    for (let w = 0; w * per < squares.length; w++) {
+      const part = squares.slice(w * per, (w + 1) * per);
+      const inputs = new Float32Array(part.length * size);
+      part.forEach((sq, i) => this.crop(img, project, sq, inputs.subarray(i * size, (i + 1) * size)));
+      const id = this.nextId++;
+      parts.push(new Promise((resolve) => {
+        this.pending.set(id, (d) => {
+          if (d.error) { resolve(this.classify(img, project, part)); return; }
+          const out = new Map(), k = d.probs.length / part.length, e = d.embs.length / part.length;
+          part.forEach((sq, i) => out.set(sq, { probs: d.probs.subarray(i * k, (i + 1) * k), emb: d.embs.subarray(i * e, (i + 1) * e) }));
+          resolve(out);
+        });
+        this.workers[w].postMessage({ id, inputs, count: part.length }, [inputs.buffer]);
+      }));
+    }
+    return Promise.all(parts).then((maps) => new Map(maps.flatMap((m) => [...m])));
   }
 }
 
@@ -173,71 +182,115 @@ function maxpool2(inp, C, H, W, out) {
   }
 }
 
-// Merkmalsvektoren des eigenen Figurensets: aus bestätigten Stellungen gelernt. So passt sich das
-// allgemeine Netz an deine Figuren, dein Brett und dein Licht an (nächster Nachbar je Figurenart).
-const PROTO_KEY = 'schachkamera.netz.v1';
-const MAX_PROTOS = 24;
+// Anpassung an das eigene Figurenset (Idee aus chesscog: Feinabstimmung mit wenigen Bildern des
+// eigenen Sets). Aus jeder sicher bekannten Stellung kommen 64 Beispiele (Merkmalsvektor des Netzes
+// plus richtige Klasse). Darauf wird die letzte Schicht des Netzes nachtrainiert, und zwar so, dass
+// sie nah an der ursprünglichen bleibt. Das geht im Browser in wenigen Millisekunden.
+const ADAPT_KEY = 'schachkamera.anpassung.v2';
+const PER_CLASS = 48;
 
-export class ProtoStore {
-  constructor(data) {
-    this.t = { w: {}, b: {} };
-    for (const c of ['w', 'b']) for (const ty of TYPES) this.t[c][ty] = (data?.t?.[c]?.[ty] || []).map(decode);
+export class Adapter {
+  constructor(net, data) {
+    const fc = net.layers.find((l) => l.type === 'fc');
+    this.D = fc.wn / fc.out; this.K = fc.out;
+    this.W0 = Float32Array.from(fc.w); this.b0 = Float32Array.from(fc.bias);
+    this.W = Float32Array.from(fc.w); this.b = Float32Array.from(fc.bias);
+    this.samples = [];   // { e: Float32Array, y }
+    this.trained = false;
+    for (const [y, list] of Object.entries(data?.s || {})) for (const str of list) {
+      const e = decode(str);
+      if (e.length === this.D) this.samples.push({ e, y: Number(y) });
+    }
+    if (this.samples.length) this.train();
   }
 
-  ready(color) { return TYPES.every((ty) => this.t[color][ty].length > 0); }
+  get ready() { return this.trained; }
+  get count() { return this.samples.length; }
 
-  add(color, type, emb) {
-    const list = this.t[color][type];
-    list.push(Float32Array.from(emb));
-    if (list.length > MAX_PROTOS) list.shift();
+  // Beispiele einer bekannten Stellung: labels[sq] = Klasse 0..12, embs = Map sq -> Merkmalsvektor
+  add(embs, labels) {
+    for (const [sq, e] of embs) this.samples.push({ e: Float32Array.from(e), y: labels[sq] });
+    // je Klasse nur die neuesten Beispiele behalten
+    const byClass = new Map();
+    for (let i = this.samples.length - 1; i >= 0; i--) {
+      const s = this.samples[i];
+      const n = byClass.get(s.y) || 0;
+      if (n >= PER_CLASS) this.samples.splice(i, 1); else byClass.set(s.y, n + 1);
+    }
+    this.train();
+    this.save();
   }
 
-  // Wahrscheinlichkeit je Figurenart aus der Ähnlichkeit zu den gelernten Beispielen
-  probs(color, emb) {
-    const sims = TYPES.map((ty) => {
-      let best = -1;
-      for (const p of this.t[color][ty]) { let s = 0; for (let i = 0; i < p.length; i++) s += p[i] * emb[i]; if (s > best) best = s; }
-      return best;
-    });
-    const m = Math.max(...sims);
-    const e = sims.map((s) => Math.exp((s - m) * 25));
-    const z = e.reduce((a, b) => a + b, 0);
-    const out = {};
-    TYPES.forEach((ty, i) => { out[ty] = e[i] / z; });
-    return out;
+  // Softmax-Regression mit Abstandsstrafe zu den Original-Gewichten
+  train(steps = 150, lr = 0.5, lambda = 0.005) {
+    const { D, K, W, b, W0, b0 } = this;
+    const n = this.samples.length;
+    if (!n) return;
+    W.set(W0); b.set(b0);
+    // seltene Klassen (z. B. Könige) zählen mehr
+    const cnt = new Float32Array(K);
+    for (const s of this.samples) cnt[s.y]++;
+    const wt = this.samples.map((s) => 1 / Math.sqrt(cnt[s.y]));
+    const wsum = wt.reduce((a, c) => a + c, 0);
+    const gW = new Float32Array(K * D), gb = new Float32Array(K), z = new Float32Array(K);
+    // Schrittweite passend zur Größe der Merkmale (stabil für Softmax-Regression)
+    let sq = 0; for (const s of this.samples) for (const v of s.e) sq += v * v;
+    const step = n / Math.max(1e-6, sq);
+    for (let it = 0; it < steps; it++) {
+      gW.fill(0); gb.fill(0);
+      this.samples.forEach((s, i) => {
+        logits(W, b, s.e, D, K, z);
+        softmaxInPlace(z);
+        z[s.y] -= 1;
+        const f = wt[i] / wsum;
+        for (let k = 0; k < K; k++) {
+          const g = z[k] * f;
+          gb[k] += g;
+          const o = k * D;
+          for (let d = 0; d < D; d++) gW[o + d] += g * s.e[d];
+        }
+      });
+      for (let i = 0; i < W.length; i++) W[i] -= lr * step * (gW[i] + lambda * (W[i] - W0[i]));
+      for (let k = 0; k < K; k++) b[k] -= lr * (gb[k] + lambda * (b[k] - b0[k]));
+    }
+    this.trained = new Set(this.samples.map((s) => s.y)).size >= 8;
   }
 
-  toJSON() {
-    const t = { w: {}, b: {} };
-    for (const c of ['w', 'b']) for (const ty of TYPES) t[c][ty] = this.t[c][ty].map(encode);
-    return { t };
+  // Wahrscheinlichkeiten (13) für einen Merkmalsvektor
+  probs(emb) {
+    const z = new Float32Array(this.K);
+    logits(this.W, this.b, emb, this.D, this.K, z);
+    return softmaxInPlace(z);
   }
 
-  save() { try { localStorage.setItem(PROTO_KEY, JSON.stringify(this.toJSON())); } catch { /* Speicher voll oder gesperrt */ } }
-  static load() { try { return new ProtoStore(JSON.parse(localStorage.getItem(PROTO_KEY) || 'null')); } catch { return new ProtoStore(); } }
-  static forget() { try { localStorage.removeItem(PROTO_KEY); } catch { /* egal */ } }
+  save() {
+    const s = {};
+    for (const x of this.samples) (s[x.y] ||= []).push(encode(x.e));
+    try { localStorage.setItem(ADAPT_KEY, JSON.stringify({ s })); } catch { /* Speicher voll oder gesperrt */ }
+  }
+  static load(net) { try { return new Adapter(net, JSON.parse(localStorage.getItem(ADAPT_KEY) || 'null')); } catch { return new Adapter(net); } }
+  static forget() { try { localStorage.removeItem(ADAPT_KEY); localStorage.removeItem('schachkamera.netz.v1'); } catch { /* egal */ } }
 }
 
-// Figurenart bei bekannter Farbe: Netz und eigenes Set zusammen (gewichtetes geometrisches Mittel;
-// das Netz zählt mehr, das eigene Set gibt den Ausschlag, wenn das Netz schwankt)
-export function combinedTypeProbs(probs, emb, color, protos) {
-  const net = typeProbs(probs, color);
-  if (!protos || !protos.ready(color)) return net;
-  const own = protos.probs(color, emb);
-  const out = {};
-  let z = 0;
-  for (const ty of TYPES) { out[ty] = Math.max(1e-4, net[ty]) ** 0.7 * Math.max(1e-4, own[ty]) ** 0.3; z += out[ty]; }
-  for (const ty of TYPES) out[ty] /= z;
-  return out;
+function logits(W, b, e, D, K, z) {
+  for (let k = 0; k < K; k++) { let s = b[k]; const o = k * D; for (let d = 0; d < D; d++) s += W[o + d] * e[d]; z[k] = s; }
+}
+function softmaxInPlace(z) {
+  let m = -Infinity; for (const v of z) if (v > m) m = v;
+  let t = 0; for (let k = 0; k < z.length; k++) { z[k] = Math.exp(z[k] - m); t += z[k]; }
+  for (let k = 0; k < z.length; k++) z[k] /= t;
+  return z;
 }
 
+// Merkmalsvektoren als Float32 in Base64 (für localStorage)
 function encode(arr) {
+  const b = new Uint8Array(Float32Array.from(arr).buffer);
   let s = '';
-  for (let i = 0; i < arr.length; i++) s += String.fromCharCode(Math.max(0, Math.min(255, Math.round(arr[i] * 127 + 128))));
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
   return btoa(s);
 }
 function decode(str) {
-  const s = atob(str), out = new Float32Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = (s.charCodeAt(i) - 128) / 127;
-  return out;
+  const s = atob(str), b = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
+  return new Float32Array(b.buffer);
 }
