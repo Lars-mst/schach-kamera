@@ -24,10 +24,17 @@ und zeigt den besten nächsten Zug (Stockfish) als Overlay direkt auf dem Brett.
    kleine Bildvorlagen jeder Figurenart (im Browser, `localStorage`). Passt das Bild nicht mehr zur
    Stellung, sucht sie die Zugfolge (bis zu 3 Halbzüge, auch mit Korrektur des letzten Zuges), die
    das Bild erklärt. Findet sie keine, gibt es keinen Vorschlag, sondern einen Hinweis zum Neu-Einlesen.
-6. **Stellung scannen**: Mit gelerntem Figurenset liest die App eine Stellung mitten in der Partie
-   ein (Farben aus dem Farbmodell, Figurenart aus den Vorlagen plus Regeln wie Figurenanzahl,
-   Läuferfarben und Bauernlinien). Die erkannte Stellung wird zur Bestätigung angezeigt und lässt
-   sich per Antippen korrigieren.
+6. **Stellung einlesen mit dem Figurennetz**: Ein kleines, selbst trainiertes Faltungsnetz
+   (`src/piecenet.js`, Gewichte in `src/model/`, ca. 330 KB) bestimmt für jedes Feld „leer“ oder eine
+   der 12 Figuren. Es läuft in reinem JavaScript in einem Web Worker, also ohne Zusatzbibliothek und
+   auch auf dem iPhone. Damit liest die App jede Stellung sofort ein, ohne vorher etwas lernen zu
+   müssen. Die Regeln (genau ein König je Seite, Figurenanzahl, Läuferfarben, Bauernlinien) legen
+   die endgültige Verteilung fest. Aus jeder sicher verfolgten Stellung merkt sich die App außerdem
+   die Netz-Merkmale deines Figurensets und gleicht neue Bilder zusätzlich damit ab (Anpassung an
+   Figuren, Brett und Licht). Stammt die Stellung aus einem Scan, prüft das Netz in Ruhephasen
+   laufend alle Figuren und korrigiert eine Figurenart, wenn es mehrmals hintereinander sehr deutlich
+   widerspricht (nie den König). Ohne Netz (z. B. Laden fehlgeschlagen) gilt das alte Verfahren mit
+   Farbmodell und Bildvorlagen.
 7. **Nachführen**: Bewegt sich die Kamera, wird der Brettumriss laufend neu gesucht, die
    Ausrichtung bleibt erhalten. Jede Figur bekommt einen perspektivischen Ring auf ihrem Feld.
 
@@ -49,6 +56,24 @@ einen Link, der die Stellung in der Lichess-Analyse öffnet.
 Fair Play: Die App ist für Training und Analyse gedacht, nicht für Partien, in denen Computerhilfe
 verboten ist.
 
+## Figurennetz
+
+Training: `tools/figurennetz/` (PyTorch, eigener Code). Aus Detektionsdatensätzen mit
+Figuren-Rahmen werden Feldausschnitte erzeugt, wie die App sie sieht (Feld plus eine Feldbreite nach
+oben, 32×64 Pixel), dazu Ausschnitte leerer Felder. Das Netz hat sechs 3×3-Faltungsschichten und
+13 Ausgänge. Die Gewichte werden mit eingerechneter BatchNorm als Float32 exportiert.
+
+Trainingsdaten (alle mit freier Lizenz, Quellenangabe nach CC BY 4.0):
+
+- „Chess Pieces“ von Roboflow (Roboflow 100, `chess-pieces-mjzgj`), CC BY 4.0,
+  über https://huggingface.co/datasets/Francesco/chess-pieces-mjzgj
+- „chess_pieces_dominique“, CC BY 4.0, über https://huggingface.co/datasets/dopaul/chess-pieces-merged
+- „Chess Pieces Detection (YOLO)“ von acapitani, MIT, https://huggingface.co/datasets/acapitani/chesspiece-detection-yolo,
+  enthält Bilder aus ChessReD (Masouris & van Gemert, „End-to-End Chess Recognition“, 2024), CC BY 4.0
+
+Es wurden keine fertigen YOLO-/Ultralytics-Gewichte (AGPL) und kein GPL-/AGPL-Code übernommen.
+
 ## Lizenzen
 
-Stockfish.js ist GPLv3, chess.js BSD-2, OpenCV.js Apache 2.0.
+Stockfish.js ist GPLv3, chess.js BSD-2, OpenCV.js Apache 2.0. Das Figurennetz ist selbst trainiert
+(Daten siehe oben).

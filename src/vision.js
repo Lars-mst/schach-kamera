@@ -269,7 +269,7 @@ function pawnShift(files) {
   return dp[8];
 }
 
-export function assignTypes(cands, prior = null) {
+export function assignTypes(cands, prior = null, startBonus = 0.12) {
   // cands: [{ sq, color, sims: {p..k} }]
   // prior: Map sq -> { color, type } aus einer zuvor verfolgten Stellung (optional)
   const result = new Map();
@@ -284,7 +284,7 @@ export function assignTypes(cands, prior = null) {
     const rank = c.sq >> 3;
     if (ty === 'p' && (rank === 0 || rank === 7)) continue;
     const pr = prior?.get(c.sq);
-    const bonus = (startType(c.sq, c.color) === ty ? 0.12 : 0) + (pr && pr.color === c.color && pr.type === ty ? 0.25 : 0);
+    const bonus = (startType(c.sq, c.color) === ty ? startBonus : 0) + (pr && pr.color === c.color && pr.type === ty ? 0.25 : 0);
     options.push({ sq: c.sq, color: c.color, ty, s: c.sims[ty] + bonus });
   }
   // Könige zuerst: pro Farbe das Feld, das am meisten nach König aussieht
