@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0d1014">
+<title>Schach Kamera</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+
+  <header id="topbar">
+    <div id="status" class="pill" data-tone="idle" role="button" tabindex="0" hidden><span class="dot"></span><span id="statusText"></span></div>
+    <div id="chip" class="chip" data-tone="ok" hidden><span class="dot"></span><span id="chipText"></span></div>
+    <div class="top-actions">
+      <button id="btnSettings" class="icon-btn" aria-label="Einstellungen">⚙︎</button>
+    </div>
+  </header>
+
+  <div id="evalbar" hidden aria-hidden="true"><div id="evalfill"></div><span id="evalnum"></span></div>
+
+  <section id="panel" hidden>
+    <div id="sugMove">–</div>
+    <div id="sugMeta"></div>
+  </section>
+
+  <nav id="bottombar" hidden>
+    <button id="btnUndo" class="bar-btn" disabled>↶ Zug zurück</button>
+    <button id="btnStop" class="bar-btn">Beenden</button>
+  </nav>
+
+  <section id="intro">
+    <h1>Schach Kamera</h1>
+    <p class="lead">Richte die Kamera auf ein Schachbrett. Die App erkennt das Brett, verfolgt jeden Zug und zeigt dir direkt auf dem Brett, welche Figur wohin ziehen sollte.</p>
+    <ul class="prereq">
+      <li><b>Jede Stellung geht:</b> Ein trainiertes Figurennetz erkennt jede Figur direkt, auch mitten in der Partie. Startest du mit der Grundstellung, passt es sich zusätzlich an dein Figurenset an.</li>
+      <li><b>Kamera möglichst ruhig</b> halten oder hinstellen. Verrutscht sie, führt die App das Brett nach.</li>
+      <li><b>Von deiner Seite aus filmen:</b> Bei „Automatisch“ erkennt die App deine Farbe daran, welche Seite näher an der Kamera ist, und gibt dir sofort Tipps.</li>
+      <li><b>Ganzes Brett</b> im Bild, am besten möglichst von oben.</li>
+      <li><b>Gleichmäßiges Licht</b> ohne harte Schatten.</li>
+    </ul>
+    <label class="field">Meine Farbe
+      <select id="introColor">
+        <option value="auto">Automatisch erkennen</option>
+        <option value="w">Weiß</option>
+        <option value="b">Schwarz</option>
+      </select>
+    </label>
+    <button id="btnStart" class="primary">Kamera starten</button>
+    <p class="fine" id="introMsg"></p>
+    <p class="fine">Für Training und Analyse. In Partien, in denen Computerhilfe nicht erlaubt ist (Turniere, Online-Plattformen), bitte nicht verwenden.</p>
+  </section>
+
+  <section id="settings" hidden>
+    <div class="sheet">
+      <h2>Einstellungen</h2>
+      <div class="row">
+        <button id="btnRotate">Brett drehen</button>
+        <button id="btnAdjust">Ecken anpassen</button>
+        <button id="btnRedetect">Brett neu suchen</button>
+        <button id="btnManual">Ecken antippen</button>
+      </div>
+      <div class="row">
+        <button id="btnScan">Stellung scannen</button>
+        <button id="btnForget">Gelerntes Figurenset löschen</button>
+      </div>
+      <p class="fine" id="learnInfo"></p>
+      <label class="check"><input type="checkbox" id="pieceToggle" checked> Erkannte Figuren auf dem Brett beschriften</label>
+      <label class="check"><input type="checkbox" id="altToggle"> Zwei weitere gute Züge als dünne Pfeile zeigen</label>
+      <label class="check"><input type="checkbox" id="diagToggle"> Diagnose anzeigen (Raster, Belegung je Feld, FEN)</label>
+      <div class="row">
+        <button id="btnPgn">Partie kopieren (PGN)</button>
+        <button id="btnLichess">Stellung in Lichess öffnen</button>
+      </div>
+      <p class="fine" id="exportMsg"></p>
+      <label class="field">Kamera <select id="camSelect"></select></label>
+      <label class="field">Ich spiele
+        <select id="colorSelect">
+          <option value="auto" selected>Automatisch (Seite näher an der Kamera)</option>
+          <option value="w">Weiß</option>
+          <option value="b">Schwarz</option>
+          <option value="both">Beide Seiten (Analyse)</option>
+        </select>
+      </label>
+      <label class="field">Bedenkzeit Stockfish
+        <select id="thinkSelect">
+          <option value="300">schnell (0,3 s)</option>
+          <option value="500" selected>normal (0,5 s)</option>
+          <option value="2000">stark (2 s)</option>
+        </select>
+      </label>
+      <label class="field">Stellung (FEN)
+        <input id="fenInput" type="text" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="row">
+        <button id="btnFen">Stellung übernehmen</button>
+        <button id="btnNew">Neue Partie</button>
+        <button id="btnClose" class="primary">Fertig</button>
+      </div>
+      <p class="fine">Wird ein Zug nicht erkannt, tippe im Bild erst auf das Startfeld und dann auf das Zielfeld.</p>
+    </div>
+  </section>
+
+  <section id="scan" hidden>
+    <div class="sheet">
+      <h2>Erkannte Stellung</h2>
+      <p class="fine">Stimmt das so? Danach verfolgt die App die Partie ab hier.</p>
+      <div id="scanBoard" class="miniboard"></div>
+      <label class="field">Am Zug
+        <select id="scanTurn">
+          <option value="w">Weiß</option>
+          <option value="b">Schwarz</option>
+        </select>
+      </label>
+      <p class="fine" id="scanMsg"></p>
+      <div class="row">
+        <button id="btnScanRetry">Nochmal scannen</button>
+        <button id="btnScanCancel">Abbrechen</button>
+        <button id="btnScanOk" class="primary">Übernehmen</button>
+      </div>
+    </div>
+  </section>
+
+  <pre id="diagText" hidden></pre>
+  <canvas id="debug" hidden width="160" height="160"></canvas>
+</main>
+
+<script async src="lib/opencv.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
