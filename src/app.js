@@ -2,6 +2,7 @@
 // besten Zug berechnen (Stockfish WASM) und perspektivisch korrekt ins Kamerabild zeichnen.
 import { Chess } from './lib/chess.js';
 import { CLASSES, ColorModel, TemplateStore, classMap, colorFeatures, cropPatch, loadModel, saveModel, forgetModel, assignTypes, toFen, plausibility } from './vision.js';
+import { PieceNet, ProtoStore, NET_CLASSES, NET_EMPTY, colorProbs, combinedTypeProbs } from './piecenet.js';
 
 const $ = (s) => document.querySelector(s);
 const video = $('#video');
@@ -68,6 +69,11 @@ const S = {
   correctUntil: 0,       // bis dahin bietet die Statuszeile das Korrigieren an
   lastScan: null,
   searchKey: null,       // zuletzt erfolglos durchsuchte Abweichung
+  net: null,             // trainiertes Figurennetz (lädt im Hintergrund)
+  protos: ProtoStore.load(), // Merkmale des eigenen Figurensets für das Netz
+  netCheckAt: 0,
+  netStreak: new Map(),  // Feld+Figurenart -> wie oft das Netz hintereinander widersprochen hat
+  diagNet: null,         // letzte Einschätzung des Netzes je Feld (Diagnose)
 };
 {
   const m = loadModel();
@@ -320,18 +326,50 @@ function onBoardLocked(img, found) {
   S.fresh = false;
   S.outerT = found.t;
   setBoard(found.grid, guessOrientation(img, found.grid, found.darkParity));
-  if (S.model.ready && S.templates.ready) {
-    const scan = scanPosition(img);
-    if (scan) {
-      setBoard(S.quad, scan.o);
-      enterTrack();
-      if (toFen(scan.pieces, 'w').split(' ')[0] === new Chess().fen().split(' ')[0]) { S.game = new Chess(); S.needLearn = true; requestSuggestion(); }
-      else if (!applyScan(scan)) openScanDialog(scan);
-      return;
-    }
+  if (!canScan()) { startFromImage(img, null); return; }
+  // Stellung einlesen (das Netz rechnet im Hintergrund); solange ruht die Zugerkennung
+  S.mode = 'scanning';
+  setStatus('Lese Stellung ein …', 'search');
+  scanPosition(img).then((scan) => { if (S.mode === 'scanning') startFromImage(img, scan); });
+}
+
+function startFromImage(img, scan) {
+  if (scan) {
+    setBoard(S.quad, scan.o);
+    enterTrack();
+    // Sieht die Belegung aus wie die Grundstellung, ist es die Grundstellung (auch wenn eine Figurenart wackelt)
+    if (looksLikeStart(scan.pieces)) { S.game = new Chess(); S.lastMove = null; S.fromScan = false; S.needLearn = true; requestSuggestion(); }
+    else if (!applyScan(scan)) openScanDialog(scan);
+    return;
   }
   enterTrack();
   if (!startLooksRight(img)) setStatus('Keine Grundstellung erkannt – Grundstellung aufbauen oder im Zahnrad die Stellung eingeben', 'warn');
+}
+
+// Ecken von Hand gesetzt. Zu Beginn einer Partie wird die Stellung gleich eingelesen.
+function manualBoard(quad) {
+  const img = grab();
+  const r = img ? refineGrid(img, quad) : null;
+  // Bei manuellen Ecken keinen Einzug, nur Ausrichtung schätzen
+  setBoard(quad, img && r ? guessOrientation(img, quad, r.darkParity) : 3);
+  if (!S.fresh || !img || !canScan()) { enterTrack(); return; }
+  S.fresh = false;
+  S.mode = 'scanning';
+  setStatus('Lese Stellung ein …', 'search');
+  scanPosition(img).then((scan) => { if (S.mode === 'scanning') startFromImage(img, scan); });
+}
+
+// Einlesen geht mit dem trainierten Netz sofort, sonst erst mit gelerntem Figurenset
+const canScan = () => !!S.net || (S.model.ready && S.templates.ready);
+
+function looksLikeStart(pieces) {
+  const start = new Chess();
+  const board = start.board();
+  for (let sq = 0; sq < 64; sq++) {
+    const p = board[7 - (sq >> 3)][sq % 8], q = pieces.get(sq);
+    if (!!p !== !!q || (p && p.color !== q.color)) return false;
+  }
+  return true;
 }
 
 function startLooksRight(img) {
@@ -438,9 +476,10 @@ function involvedSquares(m) {
 
 // Wie "belegt" sieht jedes Feld aus? Vergleich mit leeren Feldern gleicher Farbe,
 // die wir aus der bekannten Stellung kennen. 0 = sieht leer aus, 1 = sieht belegt aus.
+// game: bekannte Stellung (chess.js) oder ein Array mit true für belegte Felder
 function occupancy(stats, game) {
-  const board = game.board();
-  const occupied = (sq) => !!board[7 - (sq >> 3)][sq % 8];
+  const board = Array.isArray(game) ? null : game.board();
+  const occupied = board ? (sq) => !!board[7 - (sq >> 3)][sq % 8] : (sq) => game[sq];
   const emptyRef = [false, true].map((dark) => {
     const cols = [[], [], []];
     for (let sq = 0; sq < 64; sq++) if (!occupied(sq) && isDark(sq) === dark) for (let c = 0; c < 3; c++) cols[c].push(stats.mean[sq * 3 + c]);
@@ -569,10 +608,71 @@ function retypeMove(scoreOf, d, thr) {
   return best;
 }
 
+// Das Netz schaut in Ruhephasen regelmäßig auf alle Figuren. Stammt die Stellung aus einem Scan
+// und widerspricht es bei einer Figur mehrmals hintereinander sehr deutlich, wird die Figurenart
+// korrigiert (nie beim König, und nur wenn die Stellung danach regelgerecht ist).
+function netCheckTypes(img) {
+  const now = performance.now();
+  if (!S.net || now - S.netCheckAt < (S.fromScan ? 2500 : 4000)) return;
+  if (!S.fromScan && !S.diag) return;
+  if (S.netBusy) return;
+  S.netCheckAt = now;
+  S.netBusy = true;
+  const pieces = currentPieces();
+  const fen = S.game.fen(), H = S.H;
+  S.net.classifyAsync(img, (u, v) => project(H, u, v), [...pieces.keys()]).then((res) => {
+    S.netBusy = false;
+    if (S.game.fen() !== fen || S.H !== H) return; // inzwischen gezogen oder Brett nachgeführt
+    S.diagNet = res;
+    if (S.fromScan && S.mode === 'track' && !S.inconsistent) netCorrectTypes(pieces, res);
+  });
+}
+
+function netCorrectTypes(pieces, res) {
+  const seen = new Set();
+  for (const [sq, p] of pieces) {
+    if (p.type === 'k') continue;
+    const r = res.get(sq);
+    const cp = colorProbs(r.probs);
+    if (cp[p.color] < 0.6) continue; // Netz ist sich bei der Farbe unsicher (Hand, Schatten): nichts ableiten
+    const tp = combinedTypeProbs(r.probs, r.emb, p.color, S.protos);
+    const bt = Object.keys(tp).reduce((a, b) => (tp[a] > tp[b] ? a : b));
+    if (bt === p.type || bt === 'k' || tp[bt] < 0.85 || tp[p.type] > 0.05) continue;
+    if (bt === 'p' && (sq >> 3) % 7 === 0) continue;
+    const key = sq + bt;
+    seen.add(key);
+    const n = (S.netStreak.get(key) || 0) + 1;
+    S.netStreak.set(key, n);
+    if (n < 3) continue;
+    const name = FILES[sq % 8] + ((sq >> 3) + 1);
+    const g = new Chess(S.game.fen());
+    g.remove(name);
+    g.put({ type: bt, color: p.color }, name);
+    let ok = null;
+    try { ok = new Chess(g.fen()); } catch { /* nicht regelgerecht */ }
+    if (!ok) continue;
+    S.game = ok;
+    S.notice = { text: `Figur korrigiert: ${PIECE_DE[bt]} statt ${PIECE_DE[p.type]} auf ${name}`, until: performance.now() + 5000 };
+    S.netStreak.clear();
+    S.best = null;
+    requestSuggestion();
+    return;
+  }
+  for (const k of [...S.netStreak.keys()]) if (!seen.has(k)) S.netStreak.delete(k);
+}
+
 // Wie gut passt das Bild auf dem Zielfeld zur Figurenart (0..1, ohne gelerntes Set 0,5)?
 function typeFit(color, type, square) {
-  if (!S.templates.ready || !S.lastImg || !S.H) return 0.5;
+  if (!S.lastImg || !S.H) return 0.5;
   const sq = sqIndex(square);
+  if (S.net) {
+    // Mehrere Züge können dasselbe Zielfeld haben: Ergebnis je Bild und Feld nur einmal rechnen
+    if (S.netCache?.img !== S.lastImg) S.netCache = { img: S.lastImg, map: new Map() };
+    let r = S.netCache.map.get(sq);
+    if (!r) { r = netClassify(S.lastImg, [sq]).get(sq); S.netCache.map.set(sq, r); }
+    return combinedTypeProbs(r.probs, r.emb, color, S.protos)[type];
+  }
+  if (!S.templates.ready) return 0.5;
   const sims = S.templates.similarities(color, cropPatch(S.lastImg, (u, v) => project(S.H, u, v), sq), isDark(sq));
   const vals = Object.values(sims);
   const lo = Math.min(...vals), hi = Math.max(...vals);
@@ -649,6 +749,7 @@ function trackStep(img) {
   if (S.evaluated) {
     // Passt die Stellung nicht, in Ruhe noch ein paar Mal nachsehen
     if (S.badStreak > 0 && S.stable % 7 === 0) verifyPosition(img, cur);
+    else if (S.badStreak === 0) netCheckTypes(img);
     return;
   }
   S.evaluated = true;
@@ -788,10 +889,15 @@ function verifyPosition(img, cur, urgent = false) {
     return true;
   }
   // Hält der Widerspruch an, die Stellung selbst neu einlesen (die bisherige hilft als Vorwissen)
-  if (S.badStreak >= 4 && S.model.ready && S.templates.ready) {
+  if (S.badStreak >= 4 && canScan() && !S.scanBusy) {
     if (S.cv) followBoard(img);
-    const scan = scanPosition(img);
-    if (scan && applyScan(scan)) return true;
+    S.scanBusy = true;
+    const key = S.game.fen();
+    scanPosition(img).then((scan) => {
+      S.scanBusy = false;
+      // Nur übernehmen, wenn sich in der Zwischenzeit nichts anderes geklärt hat
+      if (scan && S.mode === 'track' && S.game.fen() === key && S.badStreak >= 4) applyScan(scan);
+    });
   }
   if (mism.length >= 2 || S.badStreak >= 3) {
     if (!S.inconsistent) {
@@ -858,31 +964,95 @@ function learn(img, cur, feats) {
     const p = board[7 - (sq >> 3)][sq % 8];
     if (p && !S.fromScan) S.templates.add(p.color, p.type, cropPatch(img, proj, sq), isDark(sq));
   }
+  if (S.net && !S.fromScan) learnProtos(img, board);
   S.needLearn = false;
   saveModel(S.model, S.templates);
   updateLearnInfo();
 }
 
+// Dem Netz das eigene Figurenset zeigen: je Figurenart und Farbe ein zufälliges Feld (hält es schnell)
+function learnProtos(img, board) {
+  const pick = new Map();
+  for (let sq = 0; sq < 64; sq++) {
+    const p = board[7 - (sq >> 3)][sq % 8];
+    if (!p) continue;
+    const k = p.color + p.type;
+    const list = pick.get(k) || [];
+    list.push(sq); pick.set(k, list);
+  }
+  const squares = [...pick.values()].map((l) => l[(Math.random() * l.length) | 0]);
+  const H = S.H;
+  S.net.classifyAsync(img, (u, v) => project(H, u, v), squares).then((res) => {
+    for (const sq of squares) {
+      const p = board[7 - (sq >> 3)][sq % 8];
+      S.protos.add(p.color, p.type, res.get(sq).emb);
+    }
+    S.protos.save();
+    updateLearnInfo();
+  });
+}
+
+// Netz auf einzelne Felder des aktuellen Bildes anwenden
+function netClassify(img, squares) {
+  return S.net.classify(img, (u, v) => project(S.H, u, v), squares);
+}
+
 function updateLearnInfo() {
-  $('#learnInfo').textContent = S.model.ready && S.templates.ready
-    ? 'Dein Figurenset ist gelernt: Stellungen mitten in der Partie können eingelesen werden.'
-    : 'Noch kein Figurenset gelernt: einmal mit der Grundstellung starten und einen Zug spielen.';
+  const own = S.protos.ready('w') && S.protos.ready('b');
+  $('#learnInfo').textContent = S.net
+    ? (own ? 'Figurennetz aktiv und an dein Figurenset angepasst.' : 'Figurennetz aktiv: Stellungen werden sofort eingelesen. Mit der Grundstellung zu starten passt es zusätzlich an dein Figurenset an.')
+    : S.model.ready && S.templates.ready
+      ? 'Dein Figurenset ist gelernt: Stellungen mitten in der Partie können eingelesen werden.'
+      : 'Noch kein Figurenset gelernt: einmal mit der Grundstellung starten und einen Zug spielen.';
 }
 
 /* ---------- Stellung einlesen ---------- */
 
-function scanPosition(img) {
-  if (!S.model.ready || !S.templates.ready || !S.H) return null;
+async function scanPosition(img) {
+  if (!S.H || !canScan()) return null;
+  const H = S.H;
+  const proj = (u, v) => project(H, u, v);
+  // Das Netz sagt für jedes Feld leer / weiß / schwarz und die Figurenart. Zusammen mit dem
+  // gelernten Farbmodell (falls vorhanden) entscheidet es über die Belegung.
+  const net = S.net ? await S.net.classifyAsync(img, proj, [...Array(64).keys()]) : null;
+  if (S.H !== H && S.quad) return null; // Brett wurde inzwischen neu ausgerichtet
   const cur = features(img);
-  const ll = S.model.logLik(colorFeatures(cur, PER));
+  const ll = S.model.ready ? S.model.logLik(colorFeatures(cur, PER)) : new Float32Array(64 * 3);
+  if (net) {
+    for (let sq = 0; sq < 64; sq++) {
+      const cp = colorProbs(net.get(sq).probs);
+      CLASSES.forEach((c, k) => { ll[sq * 3 + k] += 2 * Math.log(Math.max(0.01, cp[c])); });
+    }
+    S.diagNet = net;
+    // Zweite Meinung zu leer/belegt ohne Gelerntes: Felder, die das Netz für leer hält, dienen als
+    // Vergleich (Farbe des leeren Feldes), alle anderen werden daran gemessen.
+    if (!S.model.ready) {
+      const guess = Array.from({ length: 64 }, (_, sq) => net.get(sq).probs[NET_EMPTY] < 0.5);
+      const { occ, reliable } = occupancy(squareStats(cur), guess);
+      if (reliable) for (let sq = 0; sq < 64; sq++) {
+        ll[sq * 3] -= 3 * Math.max(0, occ[sq] - 0.3);
+        ll[sq * 3 + 1] -= 3 * Math.max(0, 0.7 - occ[sq]);
+        ll[sq * 3 + 2] -= 3 * Math.max(0, 0.7 - occ[sq]);
+      }
+    }
+  }
   const cls = [];
   for (let sq = 0; sq < 64; sq++) {
     const row = [ll[sq * 3], ll[sq * 3 + 1], ll[sq * 3 + 2]];
     cls.push(CLASSES[row.indexOf(Math.max(...row))]);
   }
-  const proj = (u, v) => project(S.H, u, v);
+  // Mehr als 16 Figuren einer Farbe gibt es nicht: die unsichersten werden zu leeren Feldern
+  for (const [color, k] of [['w', 1], ['b', 2]]) {
+    const mine = [];
+    for (let sq = 0; sq < 64; sq++) if (cls[sq] === color) mine.push({ sq, m: ll[sq * 3 + k] - ll[sq * 3] });
+    mine.sort((a, b) => a.m - b.m).slice(0, Math.max(0, mine.length - 16)).forEach(({ sq }) => { cls[sq] = 'e'; });
+  }
   const sims = new Map();
-  for (let sq = 0; sq < 64; sq++) if (cls[sq] !== 'e') sims.set(sq, S.templates.similarities(cls[sq], cropPatch(img, proj, sq), isDark(sq)));
+  for (let sq = 0; sq < 64; sq++) {
+    if (cls[sq] === 'e') continue;
+    if (net) { const r = net.get(sq); sims.set(sq, combinedTypeProbs(r.probs, r.emb, cls[sq], S.protos)); }
+    else sims.set(sq, S.templates.similarities(cls[sq], cropPatch(img, proj, sq), isDark(sq)));
+  }
   // Die zuletzt verfolgte Stellung hilft beim Zuordnen: was dort stand, steht oft noch da
   const prior = new Map();
   if (S.game.history().length || S.game.fen() !== new Chess().fen()) {
@@ -896,7 +1066,8 @@ function scanPosition(img) {
     const cands = [];
     for (let s = 0; s < 64; s++) if (cls[perm[s]] !== 'e') cands.push({ sq: s, color: cls[perm[s]], sims: sims.get(perm[s]) });
     if (!cands.some((c) => c.color === 'w') || !cands.some((c) => c.color === 'b')) continue;
-    const pieces = assignTypes(cands, prior);
+    // Mit dem Netz zählt das Bild mehr als die Vermutung „steht noch auf dem Ausgangsfeld“
+    const pieces = assignTypes(cands, prior, net ? 0.04 : 0.12);
     if (DEBUG && o === S.a1) console.log('verify-scan', cands.map((c) => FILES[c.sq % 8] + ((c.sq >> 3) + 1) + ':' + Object.entries(c.sims).sort((x, y) => y[1] - x[1]).slice(0, 2).map(([t, v]) => t + v.toFixed(2)).join('/')).join(' '));
     let fit = 0;
     for (const c of cands) fit += c.sims[pieces.get(c.sq).type];
@@ -980,21 +1151,23 @@ $('#btnScanOk').addEventListener('click', () => {
   idleStatus();
   requestSuggestion();
 });
-$('#btnScanRetry').addEventListener('click', () => {
-  const scan = scanPosition(grab());
+$('#btnScanRetry').addEventListener('click', async () => {
+  const scan = await scanPosition(grab());
   if (scan) openScanDialog(scan); else $('#scanMsg').textContent = 'Brett gerade nicht gut zu sehen. Hand weg und nochmal versuchen.';
 });
 $('#btnScanCancel').addEventListener('click', () => { S.scan = null; $('#scan').hidden = true; });
 
 function startScan(auto = false) {
   if (!S.quad) { setStatus('Erst muss das Brett erkannt sein', 'warn'); return; }
-  if (!S.model.ready || !S.templates.ready) {
+  if (!canScan()) {
     setStatus('Noch kein Figurenset gelernt – einmal mit Grundstellung starten', 'warn');
     return;
   }
-  const scan = scanPosition(grab());
-  if (!scan) return;
-  if (!auto || !applyScan(scan)) openScanDialog(scan);
+  setStatus('Lese Stellung ein …', 'search');
+  scanPosition(grab()).then((scan) => {
+    if (!scan) { idleStatus(); return; }
+    if (!auto || !applyScan(scan)) openScanDialog(scan);
+  });
 }
 
 /* ---------- Stockfish ---------- */
@@ -1438,6 +1611,20 @@ function drawDiag(vm) {
     octx.fillStyle = v > 50 ? '#5fe0a1' : '#c9d2da';
     octx.fillText(String(v), x, y);
   }
+  // Was das Figurennetz zuletzt auf dem Feld gesehen hat (rot: widerspricht der Stellung)
+  if (S.diagNet) {
+    const board = S.game.board();
+    for (const [sq, r] of S.diagNet) {
+      let k = 0;
+      for (let i = 1; i < 13; i++) if (r.probs[i] > r.probs[k]) k = i;
+      const p = board[7 - (sq >> 3)][sq % 8];
+      const want = p ? (p.color === 'w' ? p.type.toUpperCase() : p.type) : '.';
+      const [x, y] = boardToScreen((sq % 8) + 0.5, (sq >> 3) + 0.15, vm);
+      octx.fillStyle = 'rgba(0,0,0,0.6)'; octx.fillRect(x - 13, y - 6, 26, 12);
+      octx.fillStyle = NET_CLASSES[k] === want ? '#7fd3ff' : '#ff8a80';
+      octx.fillText(NET_CLASSES[k] + ' ' + Math.round(r.probs[k] * 100), x, y);
+    }
+  }
   // Ecken nummerieren (a1 zuerst)
   cornersFrom(S.quad, S.a1).forEach((p, i) => {
     const [x, y] = toScreen(p, vm);
@@ -1450,6 +1637,7 @@ function drawDiag(vm) {
     `Am Zug: ${S.game.turn() === 'w' ? 'Weiß' : 'Schwarz'} · Ich: ${S.myColor === 'both' ? 'beide' : S.myColor === 'w' ? 'Weiß' : 'Schwarz'}${S.colorAuto ? ' (auto)' : ''}`,
     `Erkennung: ${S.scanState} · ruhig ${S.stable} · Abweichungen ${S.mismatch.length}${S.inconsistent ? ' (unstimmig)' : ''}`,
     `Farbmodell ${S.model.ready ? 'gelernt' : 'fehlt'} · Figurenset ${S.templates.ready ? 'gelernt' : 'fehlt'}${S.fromScan ? ' · Stellung aus Scan' : ''}`,
+    `Figurennetz ${S.net ? 'aktiv' : 'lädt/fehlt'} · eigenes Set ${S.protos.ready('w') && S.protos.ready('b') ? 'angepasst' : 'noch nicht'}`,
     `Stockfish T${engine.depth || 0}${S.pv.length ? ' · ' + S.pv.slice(0, 5).join(' ') : ''}`,
   ];
   $('#diagText').textContent = lines.join('\n');
@@ -1540,12 +1728,8 @@ overlay.addEventListener('pointerdown', (e) => {
     setStatus(`Ecke ${S.manualPts.length} von 4 gesetzt`, 'search');
     if (S.manualPts.length === 4) {
       const quad = orderQuad(S.manualPts);
-      const img = grab();
-      const r = img ? refineGrid(img, quad) : null;
-      // Bei manuellen Ecken keinen Einzug, nur Ausrichtung schätzen
-      setBoard(quad, img && r ? guessOrientation(img, quad, r.darkParity) : 3);
       S.manualPts = [];
-      enterTrack();
+      manualBoard(quad);
     }
     return;
   }
@@ -1626,8 +1810,8 @@ try {
   $('#altToggle').checked = S.showAlts; $('#diagToggle').checked = S.diag; $('#diagText').hidden = !S.diag;
 } catch { /* egal */ }
 $('#btnForget').addEventListener('click', () => {
-  forgetModel();
-  S.model = new ColorModel(); S.templates = new TemplateStore();
+  forgetModel(); ProtoStore.forget();
+  S.model = new ColorModel(); S.templates = new TemplateStore(); S.protos = new ProtoStore();
   S.needLearn = true; S.mismatch = []; S.badStreak = 0;
   if (S.inconsistent) { S.inconsistent = false; idleStatus(); requestSuggestion(); }
   updateLearnInfo();
@@ -1707,7 +1891,8 @@ renderSuggestion();
 updateLearnInfo();
 startEngine();
 waitForCv().then(({ cv }) => { S.cv = cv; });
+PieceNet.load().then((n) => { S.net = n; updateLearnInfo(); }).catch((err) => console.warn('Figurennetz nicht geladen', err));
 requestAnimationFrame(loop);
 requestAnimationFrame(draw);
-if (DEBUG) window.__dbg = { findQuads, refineGrid, grab, guessOrientation,
+if (DEBUG) window.__dbg = { findQuads, refineGrid, grab, guessOrientation, manualBoard,
   ll: () => { const f = features(grab()); const ll = S.model.logLik(colorFeatures(f, PER)); const cf = colorFeatures(f, PER); return Array.from({ length: 64 }, (_, q) => FILES[q % 8] + ((q >> 3) + 1) + ' ' + [0, 1, 2].map((k) => ll[q * 3 + k].toFixed(1)).join('/') + ' f=' + Array.from(cf.slice(q * 5, q * 5 + 5)).map((x) => x.toFixed(2)).join(',')); } };
