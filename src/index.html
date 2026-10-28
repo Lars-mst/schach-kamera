@@ -21,6 +21,8 @@
     </div>
   </header>
 
+  <div id="evalbar" hidden aria-hidden="true"><div id="evalfill"></div><span id="evalnum"></span></div>
+
   <section id="panel" hidden>
     <div id="sugMove">–</div>
     <div id="sugMeta"></div>
@@ -67,6 +69,7 @@
         <button id="btnForget">Gelerntes Figurenset löschen</button>
       </div>
       <p class="fine" id="learnInfo"></p>
+      <label class="check"><input type="checkbox" id="pieceToggle" checked> Erkannte Figuren auf dem Brett beschriften</label>
       <label class="check"><input type="checkbox" id="altToggle"> Zwei weitere gute Züge als dünne Pfeile zeigen</label>
       <label class="check"><input type="checkbox" id="diagToggle"> Diagnose anzeigen (Raster, Belegung je Feld, FEN)</label>
       <div class="row">
