@@ -41,7 +41,13 @@ npm run serve   # http://localhost:8080
 
 Auf dem iPhone braucht die Kamera HTTPS, daher dort https://lars-mst.github.io/schach-kamera/ nutzen.
 Jeder Push auf `main` baut die App neu und veröffentlicht sie über den Zweig `gh-pages`.
-Mit `?debug=1` wird oben links die entzerrte Brettansicht eingeblendet.
+Mit `?debug=1` wird oben links die entzerrte Brettansicht eingeblendet. In den Einstellungen gibt es
+außerdem eine Diagnoseansicht (Raster, Belegung je Feld in Prozent, Ecken, FEN, Engine-Variante),
+optionale Zusatzpfeile für die zweit- und drittbeste Variante (Stockfish MultiPV), PGN-Export und
+einen Link, der die Stellung in der Lichess-Analyse öffnet.
+
+Fair Play: Die App ist für Training und Analyse gedacht, nicht für Partien, in denen Computerhilfe
+verboten ist.
 
 ## Lizenzen
 

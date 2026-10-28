@@ -15,6 +15,7 @@
 
   <header id="topbar">
     <div id="status" class="pill" data-tone="idle" role="button" tabindex="0" hidden><span class="dot"></span><span id="statusText"></span></div>
+    <div id="chip" class="chip" data-tone="ok" hidden><span class="dot"></span><span id="chipText"></span></div>
     <div class="top-actions">
       <button id="btnSettings" class="icon-btn" aria-label="Einstellungen">⚙︎</button>
     </div>
@@ -49,6 +50,7 @@
     </label>
     <button id="btnStart" class="primary">Kamera starten</button>
     <p class="fine" id="introMsg"></p>
+    <p class="fine">Für Training und Analyse. In Partien, in denen Computerhilfe nicht erlaubt ist (Turniere, Online-Plattformen), bitte nicht verwenden.</p>
   </section>
 
   <section id="settings" hidden>
@@ -65,6 +67,13 @@
         <button id="btnForget">Gelerntes Figurenset löschen</button>
       </div>
       <p class="fine" id="learnInfo"></p>
+      <label class="check"><input type="checkbox" id="altToggle"> Zwei weitere gute Züge als dünne Pfeile zeigen</label>
+      <label class="check"><input type="checkbox" id="diagToggle"> Diagnose anzeigen (Raster, Belegung je Feld, FEN)</label>
+      <div class="row">
+        <button id="btnPgn">Partie kopieren (PGN)</button>
+        <button id="btnLichess">Stellung in Lichess öffnen</button>
+      </div>
+      <p class="fine" id="exportMsg"></p>
       <label class="field">Kamera <select id="camSelect"></select></label>
       <label class="field">Ich spiele
         <select id="colorSelect">
@@ -113,6 +122,7 @@
     </div>
   </section>
 
+  <pre id="diagText" hidden></pre>
   <canvas id="debug" hidden width="160" height="160"></canvas>
 </main>
 

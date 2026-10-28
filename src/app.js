@@ -57,6 +57,10 @@ const S = {
   inconsistent: false,
   notice: null,          // { text, until }
   scan: null,            // offene Scan-Bestätigung
+  scanState: 'ok',       // ok | hand | cam: für die kleine Statusanzeige
+  alts: [],              // weitere gute Züge (MultiPV)
+  showAlts: false,
+  diag: false,           // Diagnoseansicht
   flash: null,           // { squares, at }: gerade erkannter Zug
   pv: [],                // Hauptvariante von Stockfish zur aktuellen Stellung
   expect: null,          // erwarteter nächster Zug (uci): Vorschlag oder vorhergesagte Antwort
@@ -621,6 +625,7 @@ function trackStep(img) {
   // Bewegt sich das ganze Bild, hat sich die Kamera bewegt (nicht nur eine Hand über dem Brett)
   const globalMotion = median(motion) > 9;
   if (globalMotion) {
+    S.scanState = 'cam';
     S.camMoving = true;
     if (S.cv && S.tick % 2 === 0) followBoard(img);
     S.prev = features(img); S.stable = 0; S.evaluated = false; S.ref = null;
@@ -637,7 +642,8 @@ function trackStep(img) {
   const cur = cur0;
   S.prev = cur;
   const moving = Math.max(...motion) > Math.max(10, median(motion) * 3 + 6);
-  if (moving) { S.stable = 0; S.evaluated = false; return; }
+  if (moving) { S.stable = 0; S.evaluated = false; S.scanState = 'hand'; return; }
+  S.scanState = 'ok';
   S.stable++;
   if (S.stable < 2) return;
   if (S.evaluated) {
@@ -649,6 +655,7 @@ function trackStep(img) {
   if (!S.ref) { S.ref = cur; if (!verifyPosition(img, cur) && !S.inconsistent) idleStatus(); return; }
 
   S.lastImg = img;
+  if (S.diag) S.diagOcc = occupancy(squareStats(cur), S.game).occ;
   const res = detectMove(cur, S.ref);
   if (DEBUG) console.log('detect', res.kind, res.move?.san || '', res.score?.toFixed(2) || '', res.margin?.toFixed(2) || '', res.orientation ?? '');
   if (res.kind === 'none') { S.ref = cur; if (!verifyPosition(img, cur) && !S.unclear && !S.inconsistent) idleStatus(); return; }
@@ -731,6 +738,7 @@ function verifyPosition(img, cur, urgent = false) {
   // Zwei unabhängige Prüfungen: das gelernte Farbmodell (leer/weiß/schwarz) und eine einfache
   // Belegt/Leer-Messung gegen die leeren Felder. Die zweite braucht nichts Gelerntes.
   const { occ, reliable } = occupancy(squareStats(cur), S.game);
+  S.diagOcc = occ;
   const feats = colorFeatures(cur, PER);
   let ll;
   if (S.model.ready) ll = S.model.logLik(feats);
@@ -1014,7 +1022,11 @@ function startEngine() {
 function go(fen) {
   if (!engine.ready) { engine.next = fen; return; }
   if (engine.busy) { engine.next = fen; engine.worker.postMessage('stop'); return; }
-  engine.next = null; engine.busy = true; engine.fen = fen; engine.info = null;
+  engine.next = null; engine.busy = true; engine.fen = fen; engine.info = null; engine.depth = 0;
+  S.alts = [];
+  // Varianten nur auf Wunsch: jede zusätzliche Variante kostet Rechenzeit für den besten Zug
+  const multi = S.showAlts ? 3 : 1;
+  if (engine.multi !== multi) { engine.worker.postMessage('setoption name MultiPV value ' + multi); engine.multi = multi; }
   engine.worker.postMessage('position fen ' + fen);
   engine.worker.postMessage('go movetime ' + S.thinkMs);
 }
@@ -1022,11 +1034,19 @@ function go(fen) {
 // Schon während Stockfish rechnet, den bisher besten Zug zeigen: so steht nach wenigen
 // Zehntelsekunden ein Vorschlag da, der danach höchstens noch präzisiert wird.
 function onInfo(line) {
-  engine.info = line;
   if (engine.next || engine.fen !== S.game.fen()) return;
+  const depth = Number(line.match(/ depth (\d+)/)?.[1] || 0);
+  const k = Number(line.match(/ multipv (\d+)/)?.[1] || 1);
+  if (k > 1) {
+    // Alternativen (2. und 3. Variante) als dezente Zusatzpfeile
+    const alt = line.match(/ pv (\S+)/)?.[1];
+    if (alt && depth >= 8) S.alts[k - 2] = alt;
+    return;
+  }
+  engine.info = line;
+  engine.depth = depth;
   const pv = line.match(/ pv (.+)$/)?.[1].split(' ');
   if (pv) S.pv = pv;
-  const depth = Number(line.match(/ depth (\d+)/)?.[1] || 0);
   if (depth < 6) return;
   const uci = line.match(/ pv (\S+)/)?.[1];
   if (uci && (!S.best || S.best.uci !== uci)) setBest(uci, false);
@@ -1154,8 +1174,21 @@ function squarePoly(name, vm, inset = 0) {
   return [[f + inset, r + inset], [f + 1 - inset, r + inset], [f + 1 - inset, r + 1 - inset], [f + inset, r + 1 - inset]].map(([u, v]) => boardToScreen(u, v, vm));
 }
 
+// Kleine Statusanzeige oben links: was die Erkennung gerade sieht und wie tief Stockfish ist
+function updateChip() {
+  const chip = $('#chip');
+  if (S.mode !== 'track') { chip.hidden = true; return; }
+  chip.hidden = false;
+  const scan = { ok: 'Brett stabil', hand: 'Hand im Bild', cam: 'Kamera bewegt' }[S.scanState] || '';
+  const eng = engine.busy ? `rechnet · T${engine.depth || 0}` : engine.depth ? `T${engine.depth}` : '';
+  const text = [scan, eng].filter(Boolean).join(' · ');
+  if (chip.dataset.text !== text) { $('#chipText').textContent = text; chip.dataset.text = text; }
+  chip.dataset.tone = S.scanState;
+}
+
 function draw(t) {
   requestAnimationFrame(draw);
+  updateChip();
   if (S.notice && S.notice.until <= performance.now()) { S.notice = null; renderSuggestion(); }
   if (S.correctUntil && S.correctUntil <= performance.now()) { S.correctUntil = 0; if ($('#status').dataset.tone === 'info') idleStatus(); }
   const dpr = window.devicePixelRatio || 1;
@@ -1202,7 +1235,11 @@ function draw(t) {
       octx.fillStyle = 'rgba(127,211,255,0.45)';
       polyPath(squarePoly(S.tapFrom, vm, 0.04)); octx.fill();
     }
-    if (S.best && !S.inconsistent) drawBest(t, vm, cMove);
+    if (S.best && !S.inconsistent) {
+      if (S.showAlts) drawAlts(vm);
+      drawBest(t, vm, cMove);
+    }
+    if (S.diag) drawDiag(vm);
 
     if (S.mode === 'adjust') {
       // Raster nur beim Anpassen der Ecken, damit man die Felder ausrichten kann
@@ -1359,6 +1396,65 @@ function drawBest(t, vm, color) {
   octx.restore();
 }
 
+// Alternativen: dünne, halbtransparente Pfeile ohne Animation
+function drawAlts(vm) {
+  octx.save();
+  octx.strokeStyle = 'rgba(255,255,255,0.55)'; octx.fillStyle = 'rgba(255,255,255,0.55)';
+  octx.lineCap = 'round';
+  for (const uci of S.alts.filter(Boolean)) {
+    if (uci === S.best.uci) continue;
+    const a = boardToScreen(FILES.indexOf(uci[0]) + 0.5, Number(uci[1]) - 0.5, vm);
+    const b = boardToScreen(FILES.indexOf(uci[2]) + 0.5, Number(uci[3]) - 0.5, vm);
+    const ang = Math.atan2(b[1] - a[1], b[0] - a[0]), w = 3, head = 10;
+    const base = [b[0] - Math.cos(ang) * head, b[1] - Math.sin(ang) * head];
+    octx.lineWidth = w; octx.setLineDash([6, 6]);
+    octx.beginPath(); octx.moveTo(a[0], a[1]); octx.lineTo(base[0], base[1]); octx.stroke();
+    octx.setLineDash([]);
+    octx.beginPath(); octx.moveTo(b[0], b[1]);
+    octx.lineTo(base[0] + Math.cos(ang + Math.PI / 2) * 6, base[1] + Math.sin(ang + Math.PI / 2) * 6);
+    octx.lineTo(base[0] + Math.cos(ang - Math.PI / 2) * 6, base[1] + Math.sin(ang - Math.PI / 2) * 6);
+    octx.closePath(); octx.fill();
+  }
+  octx.restore();
+}
+
+// Diagnose: Raster, Belegung je Feld (0–100 %), FEN und Erkennungsdaten zum Prüfen am echten Brett
+function drawDiag(vm) {
+  octx.save();
+  octx.lineWidth = 1; octx.strokeStyle = 'rgba(127,211,255,0.5)';
+  octx.beginPath();
+  for (let i = 0; i <= 8; i++) {
+    let [x, y] = boardToScreen(i, 0, vm); octx.moveTo(x, y); [x, y] = boardToScreen(i, 8, vm); octx.lineTo(x, y);
+    [x, y] = boardToScreen(0, i, vm); octx.moveTo(x, y); [x, y] = boardToScreen(8, i, vm); octx.lineTo(x, y);
+  }
+  octx.stroke();
+  const occ = S.diagOcc;
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.font = '600 10px -apple-system, sans-serif';
+  if (occ) for (let sq = 0; sq < 64; sq++) {
+    const [x, y] = boardToScreen((sq % 8) + 0.5, (sq >> 3) + 0.5, vm);
+    const v = Math.round(occ[sq] * 100);
+    octx.fillStyle = 'rgba(0,0,0,0.6)'; octx.fillRect(x - 12, y - 7, 24, 14);
+    octx.fillStyle = v > 50 ? '#5fe0a1' : '#c9d2da';
+    octx.fillText(String(v), x, y);
+  }
+  // Ecken nummerieren (a1 zuerst)
+  cornersFrom(S.quad, S.a1).forEach((p, i) => {
+    const [x, y] = toScreen(p, vm);
+    octx.fillStyle = '#7fd3ff'; octx.beginPath(); octx.arc(x, y, 9, 0, 7); octx.fill();
+    octx.fillStyle = '#0d1014'; octx.fillText(['a1', 'a8', 'h8', 'h1'][i], x, y);
+  });
+  octx.restore();
+  const lines = [
+    `FEN ${S.game.fen()}`,
+    `Am Zug: ${S.game.turn() === 'w' ? 'Weiß' : 'Schwarz'} · Ich: ${S.myColor === 'both' ? 'beide' : S.myColor === 'w' ? 'Weiß' : 'Schwarz'}${S.colorAuto ? ' (auto)' : ''}`,
+    `Erkennung: ${S.scanState} · ruhig ${S.stable} · Abweichungen ${S.mismatch.length}${S.inconsistent ? ' (unstimmig)' : ''}`,
+    `Farbmodell ${S.model.ready ? 'gelernt' : 'fehlt'} · Figurenset ${S.templates.ready ? 'gelernt' : 'fehlt'}${S.fromScan ? ' · Stellung aus Scan' : ''}`,
+    `Stockfish T${engine.depth || 0}${S.pv.length ? ' · ' + S.pv.slice(0, 5).join(' ') : ''}`,
+  ];
+  $('#diagText').textContent = lines.join('\n');
+}
+
 function drawDebug(img) {
   const c = $('#debug'); c.hidden = false;
   const x = c.getContext('2d'); const id = x.createImageData(160, 160);
@@ -1375,6 +1471,7 @@ function drawDebug(img) {
 
 function loop(t) {
   requestAnimationFrame(loop);
+  if (document.hidden) return;
   const interval = S.mode === 'search' ? 180 : 80;
   if (t - S.lastTick < interval) return;
   S.lastTick = t;
@@ -1510,6 +1607,24 @@ $('#btnStart').addEventListener('click', async () => {
 
 $('#btnSettings').addEventListener('click', () => { $('#fenInput').value = S.game.fen(); updateLearnInfo(); $('#settings').hidden = false; });
 $('#btnScan').addEventListener('click', () => { closeSettings(); startScan(); });
+$('#altToggle').addEventListener('change', (e) => { S.showAlts = e.target.checked; savePrefs(); requestSuggestion(); });
+$('#diagToggle').addEventListener('change', (e) => { S.diag = e.target.checked; $('#diagText').hidden = !S.diag; savePrefs(); });
+$('#btnPgn').addEventListener('click', async () => {
+  const pgn = S.game.pgn() || `[FEN "${S.game.fen()}"]`;
+  try { await navigator.clipboard.writeText(pgn); $('#exportMsg').textContent = 'Partie (PGN) kopiert.'; }
+  catch { $('#exportMsg').textContent = pgn; }
+});
+$('#btnLichess').addEventListener('click', () => {
+  window.open('https://lichess.org/analysis/standard/' + S.game.fen().replace(/ /g, '_'), '_blank', 'noopener');
+});
+function savePrefs() {
+  try { localStorage.setItem('schachkamera.optionen', JSON.stringify({ alts: S.showAlts, diag: S.diag })); } catch { /* egal */ }
+}
+try {
+  const o = JSON.parse(localStorage.getItem('schachkamera.optionen') || '{}');
+  S.showAlts = !!o.alts; S.diag = !!o.diag;
+  $('#altToggle').checked = S.showAlts; $('#diagToggle').checked = S.diag; $('#diagText').hidden = !S.diag;
+} catch { /* egal */ }
 $('#btnForget').addEventListener('click', () => {
   forgetModel();
   S.model = new ColorModel(); S.templates = new TemplateStore();
@@ -1582,6 +1697,11 @@ $('#btnStop').addEventListener('click', () => {
 $('#btnRedetect').addEventListener('click', () => { closeSettings(); S.best = null; startSearch(); });
 
 window.addEventListener('pagehide', () => S.stream?.getTracks().forEach((t) => t.stop()));
+// Im Hintergrund nichts rechnen (Akku); beim Zurückkommen Bild neu aufnehmen
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { if (engine.busy) engine.worker.postMessage('stop'); return; }
+  if (S.mode === 'track') { resetTracking(); requestSuggestion(); }
+});
 
 renderSuggestion();
 updateLearnInfo();

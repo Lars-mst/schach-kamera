@@ -100,6 +100,16 @@ button.primary { background: var(--move) !important; color: #1b1405; border-colo
 .miniboard .pw { color: #fff; text-shadow: 0 0 2px #000, 0 0 1px #000; }
 .miniboard .pb { color: #111; }
 #status[data-tone="warn"], #status[data-tone="info"] { cursor: pointer; }
+
+/* kleine Statusanzeige: Erkennung + Engine */
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; background: var(--glass); border: 1px solid var(--line); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+.chip .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
+.chip[data-tone="hand"] .dot { background: var(--move); }
+.chip[data-tone="cam"] .dot { background: var(--board); }
+#status:not([hidden]) ~ .chip { display: none; }
+.check { display: flex; gap: 10px; align-items: center; font-size: 14px; color: var(--text); }
+.check input { width: 20px; height: 20px; accent-color: var(--move); }
+#diagText { position: absolute; left: 10px; right: 10px; top: calc(env(safe-area-inset-top, 0px) + 60px); margin: 0; padding: 8px 10px; border-radius: 10px; background: rgba(0,0,0,.6); color: #c9d2da; font: 11px/1.4 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; pointer-events: none; }
 .pill[data-tone="info"] .dot { background: var(--board); }
 
 #debug { position: absolute; left: 10px; top: 70px; width: 160px; height: 160px; image-rendering: pixelated; border: 1px solid var(--line); }
